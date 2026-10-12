@@ -1,0 +1,133 @@
+# =====================================================================
+# HFT_ML4T — Production Configuration (Institutional Settings)
+# =====================================================================
+
+system:
+  environment: "LIVE"
+  polling_interval_seconds: 2.0    # Real-time scan interval (seconds)
+  log_level: "INFO"
+  log_dir: "logs"
+
+risk_desk:
+  max_daily_drawdown_usd: 300.0    # Hard halt if daily loss reaches $300
+  max_daily_drawdown_pct: 0.05     # 5.0% maximum daily drawdown
+  warning_drawdown_pct: 0.025      # 2.5% warning trigger
+  min_margin_level_percent: 300.0  # Stop trading if margin level drops below 300%
+  max_total_open_positions: 6      # Global concurrent position limit across all assets
+  max_positions_per_symbol: 1      # Max 1 concurrent position per asset
+  rollover_curfew_utc: ["21:45", "22:30"]  # Exness daily rollover spread freeze
+  post_sl_cooldown_seconds: 240    # Cooldown 4 phút sau khi dính SL để triệt tiêu Whipsaw
+  enable_breakeven_guard: true     # Tự động dời SL về hòa vốn khi lãi đạt 50% TP
+  breakeven_trigger_ratio: 0.50
+
+symbols:
+  # ===================================================================
+  # PILLAR 1: Sovereign Crypto Champion (Bitcoin) — Rank S
+  # ===================================================================
+  - name: "BTCUSDm"
+    enabled: true
+    strategy_type: "crypto"
+    magic: 777004
+    timeframe: "M15"
+    max_spread_points: 2500.0      # ~25 USD max spread cap (normal Exness spread is 600 - 1200 pts)
+    sl_multiplier: 1.8
+    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.55
+    position_sizing:
+      risk_per_trade_pct: 0.005    # 0.5% risk per trade (~$53 budget)
+      max_lot_cap: 0.10            # Tối đa 0.10 BTC
+    avellaneda_stoikov:
+      gamma: 0.10
+      kappa: 1.5
+      ofi_sensitivity: 0.25
+
+  # ===================================================================
+  # PILLAR 2: Precious Metal Champion (Gold) — Rank A
+  # ===================================================================
+  - name: "XAUUSDm"
+    enabled: true
+    strategy_type: "gold"
+    magic: 777001
+    timeframe: "M15"
+    max_spread_points: 350.0       # Max allowable spread in points (~35 pips / $0.35)
+    sl_multiplier: 1.8
+    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.55
+    position_sizing:
+      risk_per_trade_pct: 0.005    # 0.5% risk per trade
+      max_lot_cap: 0.10
+    avellaneda_stoikov:
+      gamma: 0.10
+      kappa: 1.5
+      ofi_sensitivity: 0.25
+
+  # ===================================================================
+  # PILLAR 3: Commodity Energy Champion (Crude Oil WTI) — Rank A+
+  # ===================================================================
+  - name: "USOILm"
+    enabled: true
+    strategy_type: "oil"
+    magic: 777005
+    timeframe: "M15"
+    max_spread_points: 35.0        # Max allowable spread in points (~0.035$, normal spread is 20 pts)
+    sl_multiplier: 1.8
+    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.55
+    position_sizing:
+      risk_per_trade_pct: 0.005    # 0.5% risk per trade
+      max_lot_cap: 0.08            # Tối đa 0.08 lot (80 thùng)
+    avellaneda_stoikov:
+      gamma: 0.12
+      kappa: 1.8
+      ofi_sensitivity: 0.25
+
+  # ===================================================================
+  # PILLAR 4: US Equity Index Champion (Dow Jones 30) — Rank S-
+  # ===================================================================
+  - name: "US30m"
+    enabled: true
+    strategy_type: "index"
+    magic: 777006
+    timeframe: "M15"
+    max_spread_points: 25.0        # Max allowable spread in points (~2.5$, normal spread is 10 pts)
+    sl_multiplier: 1.8
+    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.55
+    position_sizing:
+      risk_per_trade_pct: 0.005    # 0.5% risk per trade
+      max_lot_cap: 0.20            # Tối đa 0.20 lot
+    avellaneda_stoikov:
+      gamma: 0.10
+      kappa: 1.6
+      ofi_sensitivity: 0.25
+
+  # ===================================================================
+  # DEFENSIVE ALLOCATION: Major Forex Pairs (Reduced lot, Strict Trend)
+  # ===================================================================
+  - name: "EURUSDm"
+    enabled: true
+    strategy_type: "fx"
+    magic: 777003
+    timeframe: "M15"
+    max_spread_points: 15.0
+    sl_multiplier: 1.5
+    tp_multiplier: 2.5             # Tỷ lệ R:R 1:1.67
+    position_sizing:
+      risk_per_trade_pct: 0.005
+      max_lot_cap: 0.10            # Giảm từ 0.30 xuống 0.10 lot để giảm thiểu drawdown
+    avellaneda_stoikov:
+      gamma: 0.10
+      kappa: 2.0
+      ofi_sensitivity: 0.25
+
+  - name: "GBPUSDm"
+    enabled: true
+    strategy_type: "fx"
+    magic: 777002
+    timeframe: "M15"
+    max_spread_points: 18.0
+    sl_multiplier: 1.5
+    tp_multiplier: 2.5             # Tỷ lệ R:R 1:1.67
+    position_sizing:
+      risk_per_trade_pct: 0.005
+      max_lot_cap: 0.10            # Giảm từ 0.30 xuống 0.10 lot để giảm thiểu drawdown
+    avellaneda_stoikov:
+      gamma: 0.10
+      kappa: 2.0
+      ofi_sensitivity: 0.25
