@@ -209,6 +209,18 @@ class MT5Bridge:
             return [p for p in pos if p.magic == magic]
         return list(pos)
 
+    def _resolve_filling_mode(self, info: Any) -> int:
+        """Determines the optimal broker filling mode (IOC, FOK, RETURN) based on symbol policy."""
+        if not MT5_AVAILABLE or info is None:
+            return 1  # ORDER_FILLING_IOC
+        fill_flags = getattr(info, "filling_mode", 0)
+        # Check filling mode bitmask
+        if fill_flags & mt5.SYMBOL_FILLING_IOC:
+            return mt5.ORDER_FILLING_IOC
+        elif fill_flags & mt5.SYMBOL_FILLING_FOK:
+            return mt5.ORDER_FILLING_FOK
+        return mt5.ORDER_FILLING_RETURN
+
     def send_order(
         self,
         symbol: str,
@@ -248,6 +260,8 @@ class MT5Bridge:
         lot_clean = math.floor(lot / lot_step) * lot_step
         lot_clean = max(info.volume_min, min(info.volume_max, round(lot_clean, 2)))
 
+        optimal_fill = self._resolve_filling_mode(info)
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -260,14 +274,18 @@ class MT5Bridge:
             "magic": int(magic),
             "comment": comment[:31],
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": optimal_fill,
         }
 
-        # Try IOC first, fallback to RETURN or FOK if unsupported
+        # Try optimal filling mode with dynamic fallback ladder
         result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_INVALID_FILL:
-            request["type_filling"] = mt5.ORDER_FILLING_RETURN
-            result = mt5.order_send(request)
+            for fallback_fill in [mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK]:
+                if fallback_fill != optimal_fill:
+                    request["type_filling"] = fallback_fill
+                    result = mt5.order_send(request)
+                    if result and result.retcode != mt5.TRADE_RETCODE_INVALID_FILL:
+                        break
 
         if result is None:
             err = mt5.last_error()
@@ -308,13 +326,17 @@ class MT5Bridge:
             "magic": position.magic,
             "comment": comment[:31],
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": self._resolve_filling_mode(info),
         }
 
         result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_INVALID_FILL:
-            request["type_filling"] = mt5.ORDER_FILLING_RETURN
-            result = mt5.order_send(request)
+            for fallback_fill in [mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK]:
+                if fallback_fill != request["type_filling"]:
+                    request["type_filling"] = fallback_fill
+                    result = mt5.order_send(request)
+                    if result and result.retcode != mt5.TRADE_RETCODE_INVALID_FILL:
+                        break
 
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             logger.info(f"🔒 [CLOSED] Ticket #{position.ticket} {symbol} Vol {position.volume} @ {close_price:.5f}")

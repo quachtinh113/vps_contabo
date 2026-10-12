@@ -22,7 +22,7 @@ if str(_ROOT) not in sys.path:
 
 from core.central_risk_desk import CentralRiskDesk
 from core.audit_logger import setup_logger
-from engines.avellaneda_stoikov import AvellanedaStoikovEngine
+from engines.avellaneda_stoikov import AvellanedaStoikovEngine, calculate_order_flow_imbalance
 from engines.ml4t_meta_labeler import CUSUMEventFilter, calculate_garman_klass_volatility, calculate_triple_barriers, MLMetaGatekeeper
 from engines.position_sizer import PositionSizer
 from strategies.gold_micro_scalper import GoldMicroScalperStrategy
@@ -122,6 +122,31 @@ def test_garman_klass_vol():
     print("✅ test_garman_klass_vol PASSED")
 
 
+def test_order_flow_imbalance():
+    # Construct bullish surge dataset with volume
+    df_bull = pd.DataFrame({
+        "open": [2600.0, 2605.0, 2610.0, 2615.0, 2620.0],
+        "high": [2606.0, 2611.0, 2616.0, 2622.0, 2628.0],
+        "low": [2599.0, 2604.0, 2609.0, 2614.0, 2619.0],
+        "close": [2605.5, 2610.8, 2615.5, 2621.5, 2627.8],  # Close near high
+        "tick_volume": [100, 150, 200, 350, 500]             # Surging volume
+    })
+    ofi_bull = calculate_order_flow_imbalance(df_bull, window=5)
+    assert ofi_bull > 0.3, f"Expected strong positive OFI on bullish surge, got {ofi_bull}"
+
+    # Construct bearish dump dataset
+    df_bear = pd.DataFrame({
+        "open": [2620.0, 2615.0, 2610.0, 2605.0, 2600.0],
+        "high": [2621.0, 2616.0, 2611.0, 2606.0, 2601.0],
+        "low": [2614.0, 2609.0, 2604.0, 2598.0, 2590.0],
+        "close": [2614.5, 2609.2, 2604.5, 2598.5, 2590.5], # Close near low
+        "tick_volume": [100, 150, 200, 350, 500]
+    })
+    ofi_bear = calculate_order_flow_imbalance(df_bear, window=5)
+    assert ofi_bear < -0.3, f"Expected strong negative OFI on bearish dump, got {ofi_bear}"
+    print(f"✅ test_order_flow_imbalance PASSED (Bull: {ofi_bull:+.2f}, Bear: {ofi_bear:+.2f})")
+
+
 def test_strategy_instantiations():
     import yaml
     with open(_ROOT / "config" / "hft_config.yaml", "r", encoding="utf-8") as f:
@@ -151,6 +176,7 @@ if __name__ == "__main__":
     test_quantization_guard()
     test_central_risk_desk()
     test_garman_klass_vol()
+    test_order_flow_imbalance()
     test_strategy_instantiations()
-    print("🎉 ALL 6 INTEGRATION TESTS PASSED SUCCESSFULLY!\n")
+    print("🎉 ALL 7 INTEGRATION TESTS PASSED SUCCESSFULLY!\n")
 

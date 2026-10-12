@@ -1,17 +1,24 @@
+from pathlib import Path
 import pandas as pd
 import json
 
-with open(r"C:\VPS CONTABO\HFT_ML4T\logs\trade_audit.jsonl", "r", encoding="utf-8") as f:
-    records = [json.loads(line) for line in f if line.strip()]
+log_path = Path(__file__).resolve().parent / "logs" / "trade_audit.jsonl"
+if log_path.exists():
+    with open(log_path, "r", encoding="utf-8") as f:
+        records = [json.loads(line) for line in f if line.strip()]
+else:
+    records = []
 
 df = pd.DataFrame(records)
-failed = df[df['execution_status'] == 'FAILED']
-print("Total FAILED events:", len(failed))
-print("\nFailed breakdown by error message:")
-print(failed['error_message'].value_counts())
-
-print("\nFailed breakdown by symbol:")
-print(failed['symbol'].value_counts())
+if not df.empty and 'execution_status' in df.columns:
+    failed = df[df['execution_status'] == 'FAILED']
+    print("Total FAILED events:", len(failed))
+    print("\nFailed breakdown by error message:")
+    print(failed['error_message'].value_counts() if 'error_message' in failed.columns else "None")
+    print("\nFailed breakdown by symbol:")
+    print(failed['symbol'].value_counts() if 'symbol' in failed.columns else "None")
+else:
+    print("No audit log records found yet in trade_audit.jsonl (0 events).")
 
 import MetaTrader5 as mt5
 

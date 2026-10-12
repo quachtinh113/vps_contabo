@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 import pandas as pd
 import numpy as np
 
-from engines.avellaneda_stoikov import AvellanedaStoikovEngine
+from engines.avellaneda_stoikov import AvellanedaStoikovEngine, calculate_order_flow_imbalance
 from engines.ml4t_meta_labeler import CUSUMEventFilter, calculate_garman_klass_volatility, calculate_triple_barriers, MLMetaGatekeeper
 from engines.position_sizer import PositionSizer
 from core.audit_logger import get_logger
@@ -73,11 +73,8 @@ class IndexMicroScalperStrategy:
         # 1. Garman-Klass Volatility
         volatility = calculate_garman_klass_volatility(rates_df, window=20)
 
-        # 2. Order Flow Imbalance (OFI) proxy
-        last_bar = rates_df.iloc[-1]
-        hl_range = max(2.0, last_bar["high"] - last_bar["low"])
-        bar_skew = (last_bar["close"] - ((last_bar["high"] + last_bar["low"]) / 2.0)) / hl_range
-        ofi = float(np.clip(bar_skew * 1.5, -1.0, 1.0))
+        # 2. Institutional Order Flow Imbalance (OFI) proxy (ML4T Ch. 21)
+        ofi = calculate_order_flow_imbalance(rates_df, window=5)
 
         # 3. Avellaneda-Stoikov Reservation Pricing
         quotes = self.as_engine.calculate_quotes(

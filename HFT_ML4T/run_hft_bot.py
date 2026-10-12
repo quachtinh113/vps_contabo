@@ -195,7 +195,18 @@ def main():
                 if enable_breakeven and p.magic in [s.magic for s in strategies.values()]:
                     s_info = mt5_bridge.get_symbol_info(p.symbol)
                     p_point = s_info.point if s_info else 0.00001
-                    buffer_pts = p_point * 15  # 1.5 pips buffer
+                    sym_upper = p.symbol.upper()
+                    # Institutional Asset-Aware Breakeven Buffer (Prevents micro-spread stop-outs)
+                    if "BTC" in sym_upper:
+                        buffer_pts = max(p_point * 500, 5.0)   # >= $5.0 buffer for Bitcoin
+                    elif "US30" in sym_upper:
+                        buffer_pts = max(p_point * 50, 5.0)    # >= 5.0 index pts for Dow Jones
+                    elif "XAU" in sym_upper:
+                        buffer_pts = max(p_point * 25, 0.25)   # >= $0.25 buffer for Gold
+                    elif "OIL" in sym_upper:
+                        buffer_pts = max(p_point * 25, 0.05)   # >= $0.05 buffer for Crude Oil
+                    else:
+                        buffer_pts = p_point * 20              # 2.0 pips buffer for FX
 
                     if p.type == 0:  # BUY
                         if p.sl < p.price_open and p.tp > p.price_open:

@@ -5,7 +5,41 @@ Computes optimal reservation prices, spread placement, and OFI alpha skewing.
 """
 
 import math
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import numpy as np
+import pandas as pd
+
+
+def calculate_order_flow_imbalance(rates_df: pd.DataFrame, window: int = 5) -> float:
+    """
+    Institutional Order Flow Imbalance (OFI) proxy (Stefan Jansen ML4T Ch. 21 / Cont-Stoikov):
+    Combines intrabar close position relative to high/low range with multi-bar
+    volume-weighted directional momentum.
+    
+    Returns normalized OFI in [-1.0, 1.0].
+    """
+    if rates_df is None or len(rates_df) < 2:
+        return 0.0
+
+    subset = rates_df.iloc[-max(window, 3):].copy()
+    last_bar = subset.iloc[-1]
+    
+    # 1. Intrabar skew: close position within candle range [-1, 1]
+    hl_range = max(1e-6, float(last_bar["high"] - last_bar["low"]))
+    bar_skew = float((last_bar["close"] - ((last_bar["high"] + last_bar["low"]) / 2.0)) / hl_range)
+    
+    # 2. Multi-bar volume-weighted directional momentum
+    if "tick_volume" in subset.columns and subset["tick_volume"].sum() > 0:
+        vol = subset["tick_volume"].values.astype(float)
+        price_diff = subset["close"].diff().fillna(0.0).values
+        vol_weights = vol / (vol.sum() + 1e-6)
+        vw_delta = float(np.sum(np.sign(price_diff) * vol_weights))
+    else:
+        vw_delta = float(np.sign(subset["close"].iloc[-1] - subset["close"].iloc[-2]))
+
+    # 3. Blended OFI signal: 60% Intrabar skew + 40% Volume-Weighted Delta
+    combined = (0.60 * bar_skew) + (0.40 * vw_delta)
+    return float(np.clip(combined * 1.5, -1.0, 1.0))
 
 
 class AvellanedaStoikovEngine:
