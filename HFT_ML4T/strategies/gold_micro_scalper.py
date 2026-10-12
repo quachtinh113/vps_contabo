@@ -54,7 +54,8 @@ class GoldMicroScalperStrategy:
         account_equity: float,
         contract_size: float = 100.0,
         min_lot: float = 0.01,
-        lot_step: float = 0.01
+        lot_step: float = 0.01,
+        risk_multiplier: float = 1.0
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluates incoming market data for an optimal HFT order.
@@ -97,7 +98,7 @@ class GoldMicroScalperStrategy:
             action = "BUY"
         elif skew_offset < -(volatility * mid_price * 0.15) and ofi < -0.20:
             action = "SELL"
-        elif is_event:
+        elif is_event and (direction * ofi > 0) and abs(ofi) >= 0.15:
             action = "BUY" if direction > 0 else "SELL"
 
         if not action:
@@ -129,14 +130,15 @@ class GoldMicroScalperStrategy:
             tp_multiplier=self.config.get("tp_multiplier", 2.2)
         )
 
-        # 7. Safe Lot Sizing with Quantization Guard
+        # 7. Safe Lot Sizing with Quantization Guard & Nautilus De-risking Multiplier
         lot, size_reason = self.position_sizer.calculate_lot(
             account_equity=account_equity,
             entry_price=mid_price,
             sl_price=sl_price,
             contract_size=contract_size,
             min_lot=min_lot,
-            lot_step=lot_step
+            lot_step=lot_step,
+            risk_multiplier=risk_multiplier
         )
         if lot <= 0:
             logger.debug(f"[STATE_01] Lot sizing rejected: {size_reason}")

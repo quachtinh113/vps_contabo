@@ -49,7 +49,8 @@ class FXMicroArbitrageStrategy:
         account_equity: float,
         contract_size: float = 100000.0,
         min_lot: float = 0.01,
-        lot_step: float = 0.01
+        lot_step: float = 0.01,
+        risk_multiplier: float = 1.0
     ) -> Optional[Dict[str, Any]]:
         if rates_df is None or len(rates_df) < 25:
             return None
@@ -121,7 +122,8 @@ class FXMicroArbitrageStrategy:
             sl_price=sl_price,
             contract_size=contract_size,
             min_lot=min_lot,
-            lot_step=lot_step
+            lot_step=lot_step,
+            risk_multiplier=risk_multiplier
         )
         if lot <= 0:
             return None

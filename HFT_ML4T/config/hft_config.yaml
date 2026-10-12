@@ -17,8 +17,15 @@ risk_desk:
   max_positions_per_symbol: 1      # Max 1 concurrent position per asset
   rollover_curfew_utc: ["21:45", "22:30"]  # Exness daily rollover spread freeze
   post_sl_cooldown_seconds: 240    # Cooldown 4 phút sau khi dính SL để triệt tiêu Whipsaw
-  enable_breakeven_guard: true     # Tự động dời SL về hòa vốn khi lãi đạt 50% TP
-  breakeven_trigger_ratio: 0.50
+  
+  # Nautilus Dynamic Profit Locking Ladder:
+  enable_profit_ladder: true       # Thay thế Breakeven trap bằng Profit Locking Ladder
+  profit_ladder:
+    tier1_trigger_ratio: 0.50      # Khi lãi đạt 50% TP distance
+    tier1_lock_ratio: 0.25         # Khóa +25% TP distance làm lợi nhuận chắc chắn
+    tier2_trigger_ratio: 0.75      # Khi lãi đạt 75% TP distance
+    tier2_lock_ratio: 0.50         # Khóa +50% TP distance
+  max_holding_bars_m15: 16         # Nautilus Alpha Decay Time-Barrier (Tối đa 4 tiếng)
 
 symbols:
   # ===================================================================
@@ -30,8 +37,8 @@ symbols:
     magic: 777004
     timeframe: "M15"
     max_spread_points: 2500.0      # ~25 USD max spread cap (normal Exness spread is 600 - 1200 pts)
-    sl_multiplier: 1.8
-    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.55
+    sl_multiplier: 1.5
+    tp_multiplier: 3.2             # Tỷ lệ R:R 1:2.13
     position_sizing:
       risk_per_trade_pct: 0.005    # 0.5% risk per trade (~$53 budget)
       max_lot_cap: 0.10            # Tối đa 0.10 BTC
@@ -49,8 +56,8 @@ symbols:
     magic: 777001
     timeframe: "M15"
     max_spread_points: 350.0       # Max allowable spread in points (~35 pips / $0.35)
-    sl_multiplier: 1.8
-    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.55
+    sl_multiplier: 1.5
+    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Tối ưu hóa từ Win rate 60.4%)
     position_sizing:
       risk_per_trade_pct: 0.005    # 0.5% risk per trade
       max_lot_cap: 0.10
@@ -68,8 +75,8 @@ symbols:
     magic: 777005
     timeframe: "M15"
     max_spread_points: 35.0        # Max allowable spread in points (~0.035$, normal spread is 20 pts)
-    sl_multiplier: 1.8
-    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.55
+    sl_multiplier: 1.5
+    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Tối ưu hóa từ Win rate 66.2%)
     position_sizing:
       risk_per_trade_pct: 0.005    # 0.5% risk per trade
       max_lot_cap: 0.08            # Tối đa 0.08 lot (80 thùng)
@@ -87,8 +94,8 @@ symbols:
     magic: 777006
     timeframe: "M15"
     max_spread_points: 25.0        # Max allowable spread in points (~2.5$, normal spread is 10 pts)
-    sl_multiplier: 1.8
-    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.55
+    sl_multiplier: 1.5
+    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87
     position_sizing:
       risk_per_trade_pct: 0.005    # 0.5% risk per trade
       max_lot_cap: 0.20            # Tối đa 0.20 lot
@@ -98,35 +105,35 @@ symbols:
       ofi_sensitivity: 0.25
 
   # ===================================================================
-  # DEFENSIVE ALLOCATION: Major Forex Pairs (Reduced lot, Strict Trend)
+  # DEFENSIVE ALLOCATION: Major Forex Pairs (Tạm dừng để triệt tiêu hao mòn spread)
   # ===================================================================
   - name: "EURUSDm"
-    enabled: true
+    enabled: false                 # Tạm tắt để triệt tiêu hao mòn spread M15
     strategy_type: "fx"
     magic: 777003
     timeframe: "M15"
     max_spread_points: 15.0
-    sl_multiplier: 1.5
-    tp_multiplier: 2.5             # Tỷ lệ R:R 1:1.67
+    sl_multiplier: 1.3
+    tp_multiplier: 2.5
     position_sizing:
       risk_per_trade_pct: 0.005
-      max_lot_cap: 0.10            # Giảm từ 0.30 xuống 0.10 lot để giảm thiểu drawdown
+      max_lot_cap: 0.10
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 2.0
       ofi_sensitivity: 0.25
 
   - name: "GBPUSDm"
-    enabled: true
+    enabled: false                 # Tạm tắt để triệt tiêu hao mòn spread M15
     strategy_type: "fx"
     magic: 777002
     timeframe: "M15"
     max_spread_points: 18.0
-    sl_multiplier: 1.5
-    tp_multiplier: 2.5             # Tỷ lệ R:R 1:1.67
+    sl_multiplier: 1.3
+    tp_multiplier: 2.5
     position_sizing:
       risk_per_trade_pct: 0.005
-      max_lot_cap: 0.10            # Giảm từ 0.30 xuống 0.10 lot để giảm thiểu drawdown
+      max_lot_cap: 0.10
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 2.0

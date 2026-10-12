@@ -152,24 +152,38 @@ class MT5Bridge:
         self.connected = True
         return True
 
+    def resolve_symbol(self, symbol: str) -> str:
+        """Finds the actual broker symbol name (e.g. XAUUSDm vs XAUUSD)."""
+        if not self.ensure_connected() or not MT5_AVAILABLE:
+            return symbol
+        if mt5.symbol_info(symbol) is not None:
+            return symbol
+        if symbol.endswith("m") and mt5.symbol_info(symbol[:-1]) is not None:
+            return symbol[:-1]
+        if not symbol.endswith("m") and mt5.symbol_info(symbol + "m") is not None:
+            return symbol + "m"
+        return symbol
+
     def get_symbol_info(self, symbol: str) -> Optional[Any]:
-        """Retrieves and caches symbol specification."""
+        """Retrieves and caches symbol specification with auto broker suffix resolution."""
         if not self.ensure_connected():
             return None
-        info = mt5.symbol_info(symbol)
+        sym = self.resolve_symbol(symbol)
+        info = mt5.symbol_info(sym)
         if info is None or not getattr(info, "visible", True):
-            mt5.symbol_select(symbol, True)
-            info = mt5.symbol_info(symbol)
+            mt5.symbol_select(sym, True)
+            info = mt5.symbol_info(sym)
         return info
 
     def get_market_snapshot(self, symbol: str) -> Optional[Dict[str, float]]:
         """Returns live bid, ask, and spread in points."""
         if not self.ensure_connected():
             return None
-        info = self.get_symbol_info(symbol)
+        sym = self.resolve_symbol(symbol)
+        info = self.get_symbol_info(sym)
         if info is None:
             return None
-        tick = mt5.symbol_info_tick(symbol)
+        tick = mt5.symbol_info_tick(sym)
         if tick is None:
             return None
         point = info.point if info else 0.00001
@@ -184,11 +198,13 @@ class MT5Bridge:
         }
 
     def get_rates_df(self, symbol: str, timeframe: str = "M15", count: int = 100) -> Optional[pd.DataFrame]:
-        """Fetches OHLCV candlestick DataFrame."""
+        """Fetches OHLCV candlestick DataFrame with auto symbol resolution."""
         if not self.ensure_connected():
             return None
+        sym = self.resolve_symbol(symbol)
+        self.get_symbol_info(sym)  # Ensure selected in Market Watch
         tf = TIMEFRAME_MAP.get(timeframe, mt5.TIMEFRAME_M15)
-        rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+        rates = mt5.copy_rates_from_pos(sym, tf, 0, count)
         if rates is None or len(rates) == 0:
             return None
         df = pd.DataFrame(rates)

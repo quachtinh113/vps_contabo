@@ -208,20 +208,42 @@ def main():
                     else:
                         buffer_pts = p_point * 20              # 2.0 pips buffer for FX
 
+                    tp_dist = abs(p.tp - p.price_open)
+                    profit_dist = (p.price_current - p.price_open) if p.type == 0 else (p.price_open - p.price_current)
+                    
+                    # Nautilus Time-Barrier Exit (Alpha Decay after 4 hours / 16 bars M15)
+                    pos_age_sec = time.time() - p.time
+                    if pos_age_sec >= (16 * 15 * 60):
+                        logger.info(f"⏳ [TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/3600:.1f}h (Alpha Decay Horizon)")
+                        mt5_bridge.close_position(p, comment="TIME_BARRIER")
+                        continue
+
+                    # Nautilus Two-Tier Profit Locking Ladder
                     if p.type == 0:  # BUY
-                        if p.sl < p.price_open and p.tp > p.price_open:
-                            tp_dist = p.tp - p.price_open
-                            profit_dist = p.price_current - p.price_open
-                            if tp_dist > 0 and profit_dist >= tp_dist * breakeven_ratio:
-                                new_sl = p.price_open + buffer_pts
-                                mt5_bridge.modify_position_sl(p, new_sl)
+                        if tp_dist > 0:
+                            # Tier 2: Lock 50% TP when gain reaches 75% TP
+                            if profit_dist >= tp_dist * 0.75:
+                                target_sl = p.price_open + (tp_dist * 0.50)
+                                if p.sl < target_sl:
+                                    mt5_bridge.modify_position_sl(p, target_sl)
+                            # Tier 1: Lock 25% TP when gain reaches 50% TP
+                            elif profit_dist >= tp_dist * 0.50:
+                                target_sl = p.price_open + (tp_dist * 0.25)
+                                if p.sl < target_sl:
+                                    mt5_bridge.modify_position_sl(p, target_sl)
+
                     elif p.type == 1:  # SELL
-                        if p.sl > p.price_open and p.tp < p.price_open:
-                            tp_dist = p.price_open - p.tp
-                            profit_dist = p.price_open - p.price_current
-                            if tp_dist > 0 and profit_dist >= tp_dist * breakeven_ratio:
-                                new_sl = p.price_open - buffer_pts
-                                mt5_bridge.modify_position_sl(p, new_sl)
+                        if tp_dist > 0:
+                            # Tier 2: Lock 50% TP when gain reaches 75% TP
+                            if profit_dist >= tp_dist * 0.75:
+                                target_sl = p.price_open - (tp_dist * 0.50)
+                                if p.sl > target_sl or p.sl == 0:
+                                    mt5_bridge.modify_position_sl(p, target_sl)
+                            # Tier 1: Lock 25% TP when gain reaches 50% TP
+                            elif profit_dist >= tp_dist * 0.50:
+                                target_sl = p.price_open - (tp_dist * 0.25)
+                                if p.sl > target_sl or p.sl == 0:
+                                    mt5_bridge.modify_position_sl(p, target_sl)
 
             # Periodic heartbeat telemetry print (every 60s)
             if loop_start - last_status_print >= 60.0:
@@ -274,7 +296,11 @@ def main():
                 min_lot = sym_info.volume_min if sym_info else 0.01
                 lot_step = sym_info.volume_step if sym_info else 0.01
 
-                # Evaluate strategy
+                # Evaluate strategy with Nautilus De-risking Multiplier
+                risk_mult = risk_desk.get_risk_multiplier(acc["equity"])
+                if risk_mult <= 0:
+                    continue
+
                 signal_res = strat.evaluate(
                     rates_df=rates_df,
                     market_snapshot=snapshot,
@@ -282,7 +308,8 @@ def main():
                     account_equity=acc["equity"],
                     contract_size=contract_size,
                     min_lot=min_lot,
-                    lot_step=lot_step
+                    lot_step=lot_step,
+                    risk_multiplier=risk_mult
                 )
 
                 if signal_res:

@@ -35,21 +35,25 @@ class PositionSizer:
         sl_price: float,
         contract_size: float = 100.0,       # 100 for Gold, 100,000 for FX
         min_lot: float = 0.01,
-        lot_step: float = 0.01
+        lot_step: float = 0.01,
+        risk_multiplier: float = 1.0
     ) -> Tuple[float, str]:
         """
-        Calculates safe lot size.
+        Calculates safe lot size with Nautilus-style dynamic de-risking multiplier.
         Returns (lot: float, reason: str). Returns (0.0, reason) if rejected.
         """
         if account_equity <= 0:
             return 0.0, "Account equity is zero or negative"
 
+        if risk_multiplier <= 0:
+            return 0.0, "Risk Multiplier is zero (De-risking circuit breaker active)"
+
         stop_distance = abs(entry_price - sl_price)
         if stop_distance <= 0:
             return 0.0, "Invalid stop distance (zero or negative)"
 
-        # 1. Calculate Dollar Risk Budget
-        risk_budget = account_equity * self.risk_per_trade_pct
+        # 1. Calculate Dollar Risk Budget with de-risking multiplier
+        risk_budget = account_equity * self.risk_per_trade_pct * risk_multiplier
 
         # 2. Dollar loss for 1 full lot
         loss_per_lot = stop_distance * contract_size

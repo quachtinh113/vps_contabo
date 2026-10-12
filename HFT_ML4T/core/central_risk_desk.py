@@ -147,6 +147,26 @@ class CentralRiskDesk:
 
         return True, "APPROVED"
 
+    def get_risk_multiplier(self, current_equity: float) -> float:
+        """
+        Nautilus Trader Drawdown Ladder De-Risking:
+        Dynamically scales down position sizing as drawdown deepens to guarantee capital survival:
+        - DD < 2.5%: 1.0 (Full sizing)
+        - 2.5% <= DD < 4.0%: 0.75 (Tier 1 Derisking)
+        - 4.0% <= DD < 5.0%: 0.50 (Tier 2 Survival Derisking: cuts risk in half)
+        - DD >= 5.0%: 0.0 (Halted by Circuit Breaker)
+        """
+        if self._daily_peak_equity <= 0:
+            return 1.0
+        dd_pct = max(0.0, (self._daily_peak_equity - current_equity) / self._daily_peak_equity)
+        if dd_pct >= self.max_daily_drawdown_pct or self._is_halted:
+            return 0.0
+        elif dd_pct >= 0.040:
+            return 0.50
+        elif dd_pct >= self.warning_drawdown_pct:
+            return 0.75
+        return 1.0
+
     def trigger_cooldown(self, symbol: str, duration_sec: Optional[float] = None, reason: str = "") -> None:
         """Puts a symbol into a temporary cooldown after a loss / stop-loss to eliminate whipsaws."""
         dur = duration_sec if duration_sec is not None else self.post_sl_cooldown_seconds
