@@ -9,7 +9,12 @@ import pandas as pd
 import numpy as np
 
 from engines.avellaneda_stoikov import AvellanedaStoikovEngine, calculate_order_flow_imbalance
-from engines.ml4t_meta_labeler import calculate_garman_klass_volatility, calculate_triple_barriers, MLMetaGatekeeper
+from engines.ml4t_meta_labeler import (
+    calculate_garman_klass_volatility,
+    calculate_triple_barriers,
+    MLMetaGatekeeper,
+    calculate_macro_trend_ema200
+)
 from engines.position_sizer import PositionSizer
 from core.audit_logger import get_logger
 
@@ -19,6 +24,7 @@ logger = get_logger()
 class FXMicroArbitrageStrategy:
     """
     Forex Microstructure Spread Capture Strategy (State 22 / State 34 Champion).
+    Strict H1 Macro Trend Filter (EMA200 Hard Gate).
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -50,7 +56,9 @@ class FXMicroArbitrageStrategy:
         contract_size: float = 100000.0,
         min_lot: float = 0.01,
         lot_step: float = 0.01,
-        risk_multiplier: float = 1.0
+        risk_multiplier: float = 1.0,
+        h1_df: Optional[pd.DataFrame] = None,
+        ema200_h1: Optional[float] = None
     ) -> Optional[Dict[str, Any]]:
         if rates_df is None or len(rates_df) < 25:
             return None
@@ -87,7 +95,17 @@ class FXMicroArbitrageStrategy:
         if not action:
             return None
 
-        # 4. ML Gatekeeper & Macro Trend Filter
+        # 4. Institutional H1 Macro Trend Filter (EMA200 Hard Gate) — Áp dụng triệt để
+        ema200_val = ema200_h1 if ema200_h1 is not None else calculate_macro_trend_ema200(rates_df, h1_df)
+        if ema200_val is not None:
+            if action == "BUY" and mid_price < ema200_val:
+                logger.debug(f"[{self.symbol}] VETO BUY: Price {mid_price} < H1 EMA200 {ema200_val:.5f} (Bearish Macro Regime)")
+                return None
+            elif action == "SELL" and mid_price > ema200_val:
+                logger.debug(f"[{self.symbol}] VETO SELL: Price {mid_price} > H1 EMA200 {ema200_val:.5f} (Bullish Macro Regime)")
+                return None
+
+        # 5. ML Gatekeeper & Intraday Momentum Alignment
         sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
         trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         

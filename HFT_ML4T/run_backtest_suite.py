@@ -91,6 +91,25 @@ class HFTSystemBacktester:
         if df is None or len(df) < 100:
             return {"symbol": sym, "error": f"Could not fetch bars for {sym}"}
 
+        # Compute H1 Macro Trend EMA200 strictly without lookahead bias
+        df_h1 = self.load_historical_data(sym, timeframe="H1", count=max(400, bars_count // 4 + 250))
+        if df_h1 is not None and len(df_h1) >= 50:
+            df_h1 = df_h1.sort_values("time").copy()
+            df_h1["ema200_h1"] = df_h1["close"].ewm(span=200, adjust=False).mean()
+            # H1 bar finishes at open time + 1 hour
+            df_h1["time_completed"] = df_h1["time"] + pd.Timedelta(hours=1)
+            df = df.sort_values("time").copy()
+            df = pd.merge_asof(
+                df,
+                df_h1[["time_completed", "ema200_h1"]],
+                left_on="time",
+                right_on="time_completed",
+                direction="backward"
+            )
+        else:
+            df = df.sort_values("time").copy()
+            df["ema200_h1"] = df["close"].ewm(span=min(800, len(df)), adjust=False).mean().shift(1)
+
         sym_info = self.bridge.get_symbol_info(sym)
         contract_size = sym_info.trade_contract_size if sym_info else 100.0
         point = sym_info.point if sym_info else 0.00001
@@ -238,6 +257,8 @@ class HFTSystemBacktester:
                 "time": curr_bar["time"].timestamp()
             }
 
+            curr_ema200 = float(df["ema200_h1"].iloc[i]) if ("ema200_h1" in df.columns and pd.notna(df["ema200_h1"].iloc[i])) else None
+
             sig = strat.evaluate(
                 rates_df=prev_window,
                 market_snapshot=snapshot,
@@ -246,7 +267,8 @@ class HFTSystemBacktester:
                 contract_size=contract_size,
                 min_lot=0.01,
                 lot_step=0.01,
-                risk_multiplier=risk_mult
+                risk_multiplier=risk_mult,
+                ema200_h1=curr_ema200
             )
 
             if sig:

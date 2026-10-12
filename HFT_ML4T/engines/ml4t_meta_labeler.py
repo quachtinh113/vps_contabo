@@ -115,3 +115,27 @@ class MLMetaGatekeeper:
             return False, risk_score, f"ML Meta-Model Veto triggered (Risk score {risk_score:.2f} >= {self.veto_threshold})"
 
         return True, risk_score, "APPROVED"
+
+
+def calculate_macro_trend_ema200(
+    rates_df: Optional[pd.DataFrame] = None,
+    h1_df: Optional[pd.DataFrame] = None,
+    period: int = 200
+) -> Optional[float]:
+    """
+    Computes H1 Macro Trend EMA200 strictly without lookahead bias.
+    - If h1_df is provided (from MT5), uses the latest closed H1 bar's EMA200.
+    - If only rates_df (M15) is provided, calculates EMA on M15 with span = 4 * period (800 M15 bars = 200 H1 bars).
+    """
+    if h1_df is not None and len(h1_df) >= 20:
+        span = min(period, len(h1_df))
+        ema = h1_df["close"].ewm(span=span, adjust=False).mean()
+        return float(ema.iloc[-1])
+
+    if rates_df is not None and len(rates_df) >= 30:
+        span_m15 = min(period * 4, len(rates_df))
+        ema = rates_df["close"].ewm(span=span_m15, adjust=False).mean()
+        return float(ema.iloc[-1])
+
+    return None
+

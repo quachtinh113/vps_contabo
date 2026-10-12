@@ -10,7 +10,13 @@ import pandas as pd
 import numpy as np
 
 from engines.avellaneda_stoikov import AvellanedaStoikovEngine, calculate_order_flow_imbalance
-from engines.ml4t_meta_labeler import CUSUMEventFilter, calculate_garman_klass_volatility, calculate_triple_barriers, MLMetaGatekeeper
+from engines.ml4t_meta_labeler import (
+    CUSUMEventFilter,
+    calculate_garman_klass_volatility,
+    calculate_triple_barriers,
+    MLMetaGatekeeper,
+    calculate_macro_trend_ema200
+)
 from engines.position_sizer import PositionSizer
 from core.audit_logger import get_logger
 
@@ -22,6 +28,7 @@ class GoldMicroScalperStrategy:
     Sovereign State 01 Algorithm:
     - High-frequency inventory-based spread capture on Gold.
     - Avellaneda-Stoikov reservation price adjusts dynamically to inventory & order flow.
+    - Strict H1 Macro Trend Filter (EMA200 Hard Gate).
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -55,7 +62,9 @@ class GoldMicroScalperStrategy:
         contract_size: float = 100.0,
         min_lot: float = 0.01,
         lot_step: float = 0.01,
-        risk_multiplier: float = 1.0
+        risk_multiplier: float = 1.0,
+        h1_df: Optional[pd.DataFrame] = None,
+        ema200_h1: Optional[float] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluates incoming market data for an optimal HFT order.
@@ -104,7 +113,17 @@ class GoldMicroScalperStrategy:
         if not action:
             return None
 
-        # 5. ML Meta Gatekeeper Check
+        # 5. Institutional H1 Macro Trend Filter (EMA200 Hard Gate) — Áp dụng triệt để
+        ema200_val = ema200_h1 if ema200_h1 is not None else calculate_macro_trend_ema200(rates_df, h1_df)
+        if ema200_val is not None:
+            if action == "BUY" and mid_price < ema200_val:
+                logger.debug(f"[XAUUSD_PULSE] VETO BUY: Price {mid_price} < H1 EMA200 {ema200_val:.2f} (Bearish Macro Regime)")
+                return None
+            elif action == "SELL" and mid_price > ema200_val:
+                logger.debug(f"[XAUUSD_PULSE] VETO SELL: Price {mid_price} > H1 EMA200 {ema200_val:.2f} (Bullish Macro Regime)")
+                return None
+
+        # 6. ML Meta Gatekeeper Check
         sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
         trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         

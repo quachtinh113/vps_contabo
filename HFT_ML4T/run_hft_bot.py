@@ -287,16 +287,18 @@ def main():
                     continue
 
                 # Fetch candle history
+                # Fetch candle history (M15 execution + H1 Macro Trend)
                 rates_df = mt5_bridge.get_rates_df(sym, timeframe=strat.config.get("timeframe", "M15"), count=100)
                 if rates_df is None:
                     continue
+                rates_h1 = mt5_bridge.get_rates_df(sym, timeframe="H1", count=250)
 
                 sym_info = mt5_bridge.get_symbol_info(sym)
                 contract_size = sym_info.trade_contract_size if sym_info else 100.0
                 min_lot = sym_info.volume_min if sym_info else 0.01
                 lot_step = sym_info.volume_step if sym_info else 0.01
 
-                # Evaluate strategy with Nautilus De-risking Multiplier
+                # Evaluate strategy with Nautilus De-risking Multiplier & H1 Macro Trend Gate
                 risk_mult = risk_desk.get_risk_multiplier(acc["equity"])
                 if risk_mult <= 0:
                     continue
@@ -309,7 +311,8 @@ def main():
                     contract_size=contract_size,
                     min_lot=min_lot,
                     lot_step=lot_step,
-                    risk_multiplier=risk_mult
+                    risk_multiplier=risk_mult,
+                    h1_df=rates_h1
                 )
 
                 if signal_res:

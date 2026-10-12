@@ -29,7 +29,7 @@ risk_desk:
 
 symbols:
   # ===================================================================
-  # PILLAR 1: Sovereign Crypto Champion (Bitcoin) — Rank S
+  # PILLAR 1: Sovereign Crypto Champion (Bitcoin) — Giảm tỷ trọng phòng thủ
   # ===================================================================
   - name: "BTCUSDm"
     enabled: true
@@ -40,15 +40,15 @@ symbols:
     sl_multiplier: 1.5
     tp_multiplier: 3.2             # Tỷ lệ R:R 1:2.13
     position_sizing:
-      risk_per_trade_pct: 0.005    # 0.5% risk per trade (~$53 budget)
-      max_lot_cap: 0.10            # Tối đa 0.10 BTC
+      risk_per_trade_pct: 0.003    # Giảm từ 0.5% xuống 0.3% để hạn chế drawdown
+      max_lot_cap: 0.05            # Giảm từ 0.10 xuống 0.05 BTC
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 1.5
       ofi_sensitivity: 0.25
 
   # ===================================================================
-  # PILLAR 2: Precious Metal Champion (Gold) — Rank A
+  # PILLAR 2: Precious Metal Champion (Gold) — Duy trì chuẩn thể chế
   # ===================================================================
   - name: "XAUUSDm"
     enabled: true
@@ -57,17 +57,17 @@ symbols:
     timeframe: "M15"
     max_spread_points: 350.0       # Max allowable spread in points (~35 pips / $0.35)
     sl_multiplier: 1.5
-    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Tối ưu hóa từ Win rate 60.4%)
+    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0
     position_sizing:
-      risk_per_trade_pct: 0.005    # 0.5% risk per trade
-      max_lot_cap: 0.10
+      risk_per_trade_pct: 0.005    # Chuẩn 0.5% risk per trade
+      max_lot_cap: 0.08            # Khống chế 0.08 lot an toàn
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 1.5
       ofi_sensitivity: 0.25
 
   # ===================================================================
-  # PILLAR 3: Commodity Energy Champion (Crude Oil WTI) — Rank A+
+  # PILLAR 3: Commodity Energy Champion (Crude Oil WTI) — Tăng tải sinh lời (PF 1.01)
   # ===================================================================
   - name: "USOILm"
     enabled: true
@@ -76,17 +76,17 @@ symbols:
     timeframe: "M15"
     max_spread_points: 35.0        # Max allowable spread in points (~0.035$, normal spread is 20 pts)
     sl_multiplier: 1.5
-    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Tối ưu hóa từ Win rate 66.2%)
+    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Win rate 61.3%)
     position_sizing:
-      risk_per_trade_pct: 0.005    # 0.5% risk per trade
-      max_lot_cap: 0.08            # Tối đa 0.08 lot (80 thùng)
+      risk_per_trade_pct: 0.007    # Tăng từ 0.5% lên 0.7% vốn để tối đa hóa lợi nhuận
+      max_lot_cap: 0.12            # Tăng từ 0.08 lên 0.12 lot (120 thùng)
     avellaneda_stoikov:
       gamma: 0.12
       kappa: 1.8
       ofi_sensitivity: 0.25
 
   # ===================================================================
-  # PILLAR 4: US Equity Index Champion (Dow Jones 30) — Rank S-
+  # PILLAR 4: US Equity Index Champion (Dow Jones 30) — Tăng tỷ trọng ổn định (PF 0.96)
   # ===================================================================
   - name: "US30m"
     enabled: true
@@ -94,11 +94,12 @@ symbols:
     magic: 777006
     timeframe: "M15"
     max_spread_points: 25.0        # Max allowable spread in points (~2.5$, normal spread is 10 pts)
+    trading_session_utc: ["13:00", "21:00"] # Session Filter: Chỉ áp dụng riêng cho US30m (Phiên Mỹ New York)
     sl_multiplier: 1.5
-    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87
+    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87 (Win rate 55.4%)
     position_sizing:
-      risk_per_trade_pct: 0.005    # 0.5% risk per trade
-      max_lot_cap: 0.20            # Tối đa 0.20 lot
+      risk_per_trade_pct: 0.006    # Tăng từ 0.5% lên 0.6% vốn (Max DD chỉ $104)
+      max_lot_cap: 0.25            # Tăng từ 0.20 lên 0.25 lot
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 1.6

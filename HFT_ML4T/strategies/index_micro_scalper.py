@@ -6,11 +6,18 @@ Tailored for peak US session momentum and high liquidity windows.
 """
 
 from typing import Dict, Any, Optional
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 
 from engines.avellaneda_stoikov import AvellanedaStoikovEngine, calculate_order_flow_imbalance
-from engines.ml4t_meta_labeler import CUSUMEventFilter, calculate_garman_klass_volatility, calculate_triple_barriers, MLMetaGatekeeper
+from engines.ml4t_meta_labeler import (
+    CUSUMEventFilter,
+    calculate_garman_klass_volatility,
+    calculate_triple_barriers,
+    MLMetaGatekeeper,
+    calculate_macro_trend_ema200
+)
 from engines.position_sizer import PositionSizer
 from core.audit_logger import get_logger
 
@@ -24,6 +31,8 @@ class IndexMicroScalperStrategy:
     - Avellaneda-Stoikov reservation price dynamically responds to order flow skew.
     - CUSUM Event Filter identifies volatility breakouts.
     - ML Meta Gatekeeper rejects chop and pre-market low-liquidity noise.
+    - Dedicated New York Equities Session Filter (13:00 - 21:00 UTC).
+    - Strict H1 Macro Trend Filter (EMA200 Hard Gate).
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -31,6 +40,7 @@ class IndexMicroScalperStrategy:
         self.symbol = config.get("name", "US30m")
         self.magic = config.get("magic", 777006)
         self.max_spread_points = config.get("max_spread_points", 25.0)  # Max allowable spread (~2.5$)
+        self.trading_session_utc = config.get("trading_session_utc", ["13:00", "21:00"])
 
         # Engines
         as_cfg = config.get("avellaneda_stoikov", {})
@@ -57,7 +67,9 @@ class IndexMicroScalperStrategy:
         contract_size: float = 1.0,
         min_lot: float = 0.01,
         lot_step: float = 0.01,
-        risk_multiplier: float = 1.0
+        risk_multiplier: float = 1.0,
+        h1_df: Optional[pd.DataFrame] = None,
+        ema200_h1: Optional[float] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluates incoming market data for an optimal HFT order on US30.
@@ -70,6 +82,30 @@ class IndexMicroScalperStrategy:
         spread_pts = market_snapshot.get("spread_points", 99999.0)
         if mid_price <= 0 or spread_pts > self.max_spread_points:
             return None
+
+        # 0. Session Filter: US30 Index Peak Liquidity Hours (13:00 - 21:00 UTC)
+        # Chỉ áp dụng riêng cho chỉ số chứng khoán (US30m)
+        if self.trading_session_utc and len(self.trading_session_utc) == 2:
+            start_utc, end_utc = self.trading_session_utc
+            ts = market_snapshot.get("time")
+            bar_time = None
+            if ts:
+                if isinstance(ts, (int, float)):
+                    bar_time = datetime.fromtimestamp(ts, tz=timezone.utc)
+                elif isinstance(ts, datetime):
+                    bar_time = ts
+            elif rates_df is not None and "time" in rates_df.columns:
+                last_t = rates_df["time"].iloc[-1]
+                if isinstance(last_t, pd.Timestamp):
+                    bar_time = last_t.to_pydatetime()
+                elif isinstance(last_t, (int, float)):
+                    bar_time = datetime.fromtimestamp(last_t, tz=timezone.utc)
+
+            if bar_time:
+                hm_str = bar_time.strftime("%H:%M")
+                if not (start_utc <= hm_str <= end_utc):
+                    logger.debug(f"[US30_PULSE] Session filter skip: {hm_str} UTC outside {start_utc}-{end_utc}")
+                    return None
 
         # 1. Garman-Klass Volatility
         volatility = calculate_garman_klass_volatility(rates_df, window=20)
@@ -105,7 +141,17 @@ class IndexMicroScalperStrategy:
         if not action:
             return None
 
-        # 5. ML Meta Gatekeeper Check
+        # 5. Institutional H1 Macro Trend Filter (EMA200 Hard Gate) — Áp dụng triệt để
+        ema200_val = ema200_h1 if ema200_h1 is not None else calculate_macro_trend_ema200(rates_df, h1_df)
+        if ema200_val is not None:
+            if action == "BUY" and mid_price < ema200_val:
+                logger.debug(f"[US30_PULSE] VETO BUY: Price {mid_price} < H1 EMA200 {ema200_val:.2f} (Bearish Macro Regime)")
+                return None
+            elif action == "SELL" and mid_price > ema200_val:
+                logger.debug(f"[US30_PULSE] VETO SELL: Price {mid_price} > H1 EMA200 {ema200_val:.2f} (Bullish Macro Regime)")
+                return None
+
+        # 6. ML Meta Gatekeeper Check
         sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
         trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         
