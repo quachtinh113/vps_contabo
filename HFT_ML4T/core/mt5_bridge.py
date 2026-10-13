@@ -33,6 +33,11 @@ TIMEFRAME_MAP = {
     "H4": mt5.TIMEFRAME_H4 if MT5_AVAILABLE else 16388,
 }
 
+# MQL5 Symbol Filling Policy bitmask constants (not defined in MetaTrader5 Python package)
+SYMBOL_FILLING_FOK = 1  # 0x01
+SYMBOL_FILLING_IOC = 2  # 0x02
+SYMBOL_FILLING_BOC = 4  # 0x04
+
 
 class MT5Bridge:
     _instance: Optional["MT5Bridge"] = None
@@ -230,10 +235,10 @@ class MT5Bridge:
         if not MT5_AVAILABLE or info is None:
             return 1  # ORDER_FILLING_IOC
         fill_flags = getattr(info, "filling_mode", 0)
-        # Check filling mode bitmask
-        if fill_flags & mt5.SYMBOL_FILLING_IOC:
+        # Check filling mode bitmask (IOC preferred for low-latency market execution)
+        if fill_flags & SYMBOL_FILLING_IOC:
             return mt5.ORDER_FILLING_IOC
-        elif fill_flags & mt5.SYMBOL_FILLING_FOK:
+        elif fill_flags & SYMBOL_FILLING_FOK:
             return mt5.ORDER_FILLING_FOK
         return mt5.ORDER_FILLING_RETURN
 
