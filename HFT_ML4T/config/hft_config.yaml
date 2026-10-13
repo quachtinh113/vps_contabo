@@ -16,7 +16,9 @@ risk_desk:
   max_total_open_positions: 6      # Global concurrent position limit across all assets
   max_positions_per_symbol: 1      # Max 1 concurrent position per asset
   rollover_curfew_utc: ["21:45", "22:30"]  # Exness daily rollover spread freeze
-  post_sl_cooldown_seconds: 240    # Cooldown 4 phút sau khi dính SL để triệt tiêu Whipsaw
+  post_sl_cooldown_seconds: 300    # Base Cooldown (5 phút)
+  max_daily_loss_per_symbol_usd: 80.0      # Hạn mức chịu lỗ tối đa cho từng Symbol ($80/ngày)
+  consecutive_loss_cooldowns: [300, 2700, -1] # Cooldown lũy tiến: 5m -> 45m -> Khóa symbol hết ngày
   
   # Nautilus Dynamic Profit Locking Ladder:
   enable_profit_ladder: true       # Thay thế Breakeven trap bằng Profit Locking Ladder
@@ -59,8 +61,8 @@ symbols:
     sl_multiplier: 1.5
     tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0
     position_sizing:
-      risk_per_trade_pct: 0.005    # Chuẩn 0.5% risk per trade
-      max_lot_cap: 0.08            # Khống chế 0.08 lot an toàn
+      risk_per_trade_pct: 0.004    # 0.4% risk per trade an toàn
+      max_lot_cap: 0.05            # Khống chế 0.05 lot an toàn cho Vàng
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 1.5
@@ -98,8 +100,8 @@ symbols:
     sl_multiplier: 1.5
     tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87 (Win rate 55.4%)
     position_sizing:
-      risk_per_trade_pct: 0.006    # Tăng từ 0.5% lên 0.6% vốn (Max DD chỉ $104)
-      max_lot_cap: 0.25            # Tăng từ 0.20 lên 0.25 lot
+      risk_per_trade_pct: 0.005    # 0.5% vốn
+      max_lot_cap: 0.15            # Hạ từ 0.25 xuống 0.15 lot phòng thủ phiên Mỹ
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 1.6

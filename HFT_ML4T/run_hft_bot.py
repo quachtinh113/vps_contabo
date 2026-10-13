@@ -122,7 +122,9 @@ def main():
         max_positions_per_symbol=risk_cfg.get("max_positions_per_symbol", 1),
         rollover_curfew_utc=tuple(risk_cfg.get("rollover_curfew_utc", ["21:45", "22:30"])),
         halt_file=str(_ROOT / "HALT_HFT"),
-        post_sl_cooldown_seconds=risk_cfg.get("post_sl_cooldown_seconds", 240.0)
+        post_sl_cooldown_seconds=risk_cfg.get("post_sl_cooldown_seconds", 300.0),
+        max_daily_loss_per_symbol_usd=risk_cfg.get("max_daily_loss_per_symbol_usd", 80.0),
+        consecutive_loss_cooldowns=tuple(risk_cfg.get("consecutive_loss_cooldowns", [300, 2700, -1]))
     )
     risk_desk.update_account_state(acc)
 
@@ -179,11 +181,11 @@ def main():
                         exit_deal = [d for d in deal_history if d.entry == 1]
                         if exit_deal:
                             d_profit = exit_deal[0].profit + exit_deal[0].swap + exit_deal[0].commission
-                            if d_profit < 0 or "[sl " in exit_deal[0].comment.lower():
-                                risk_desk.trigger_cooldown(
-                                    sym_closed,
-                                    reason=f"Position #{t} closed at loss/SL: ${d_profit:+.2f} ({exit_deal[0].comment})"
-                                )
+                            risk_desk.record_trade_result(
+                                symbol=sym_closed,
+                                profit=d_profit,
+                                comment=exit_deal[0].comment
+                            )
                 except Exception as e:
                     logger.debug(f"Error checking closed deal #{t}: {e}")
 

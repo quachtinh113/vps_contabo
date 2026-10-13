@@ -34,7 +34,9 @@ class CentralRiskDesk:
         max_positions_per_symbol: int = 2,
         rollover_curfew_utc: Tuple[str, str] = ("21:45", "22:30"),  # Exness daily rollover freeze
         halt_file: str = "HALT_HFT",
-        post_sl_cooldown_seconds: float = 240.0
+        post_sl_cooldown_seconds: float = 240.0,
+        max_daily_loss_per_symbol_usd: float = 80.0,
+        consecutive_loss_cooldowns: Tuple[float, ...] = (300.0, 2700.0, -1.0)
     ):
         self.max_daily_drawdown_usd = max_daily_drawdown_usd
         self.max_daily_drawdown_pct = max_daily_drawdown_pct
@@ -45,15 +47,20 @@ class CentralRiskDesk:
         self.rollover_curfew_utc = rollover_curfew_utc
         self.halt_file = Path(halt_file)
         self.post_sl_cooldown_seconds = post_sl_cooldown_seconds
+        self.max_daily_loss_per_symbol_usd = max_daily_loss_per_symbol_usd
+        self.consecutive_loss_cooldowns = consecutive_loss_cooldowns
 
         self._daily_peak_equity = 0.0
         self._current_date = ""
         self._is_halted = False
         self._halt_reason = ""
         self._symbol_cooldowns: Dict[str, float] = {}
+        self._consecutive_losses: Dict[str, int] = {}
+        self._daily_symbol_pnl: Dict[str, float] = {}
+        self._symbol_locked_for_day: Dict[str, bool] = {}
 
     def update_account_state(self, account_info: Dict[str, Any]) -> None:
-        """Tracks daily peak equity and resets peak on UTC midnight."""
+        """Tracks daily peak equity and resets peak & symbol counters on UTC midnight."""
         now_utc = datetime.now(timezone.utc)
         today_str = now_utc.strftime("%Y-%m-%d")
 
@@ -62,7 +69,11 @@ class CentralRiskDesk:
         if today_str != self._current_date:
             self._current_date = today_str
             self._daily_peak_equity = current_equity
-            logger.info(f"[RISK] New UTC day: {today_str}. Daily peak equity reset to ${current_equity:,.2f}")
+            self._consecutive_losses.clear()
+            self._daily_symbol_pnl.clear()
+            self._symbol_locked_for_day.clear()
+            self._symbol_cooldowns.clear()
+            logger.info(f"[RISK] New UTC day: {today_str}. Daily peak equity reset to ${current_equity:,.2f}, per-symbol counters cleared.")
         else:
             if current_equity > self._daily_peak_equity:
                 self._daily_peak_equity = current_equity
@@ -87,6 +98,15 @@ class CentralRiskDesk:
 
         if self._is_halted:
             return False, f"Risk Desk is HALTED: {self._halt_reason}"
+
+        # 1.5 Per-Symbol Isolation Circuit Breaker (Daily loss cap & consecutive losses)
+        if self._symbol_locked_for_day.get(symbol, False):
+            return False, f"Symbol {symbol} is locked for remainder of day (Loss cap or consecutive losses breached)"
+
+        sym_pnl = self._daily_symbol_pnl.get(symbol, 0.0)
+        if sym_pnl <= -self.max_daily_loss_per_symbol_usd:
+            self._symbol_locked_for_day[symbol] = True
+            return False, f"Symbol {symbol} breached daily loss cap (-${abs(sym_pnl):.2f} >= ${self.max_daily_loss_per_symbol_usd:.2f})"
 
         # 2. Daily Drawdown Guard
         current_equity = account_info.get("equity", 0.0)
@@ -147,6 +167,52 @@ class CentralRiskDesk:
 
         return True, "APPROVED"
 
+    def record_trade_result(self, symbol: str, profit: float, comment: str = "") -> None:
+        """
+        Institutional trade result audit:
+        - Tracks per-symbol PnL and consecutive loss streaks
+        - Enforces exponential backoff cooldown ladder (5m -> 45m -> Day Lockout)
+        - Enforces per-symbol daily loss limit isolation
+        """
+        self._daily_symbol_pnl[symbol] = self._daily_symbol_pnl.get(symbol, 0.0) + profit
+        sym_pnl = self._daily_symbol_pnl[symbol]
+
+        if profit >= 0:
+            self._consecutive_losses[symbol] = 0
+            logger.info(
+                f"🏆 [RISK AUDIT] {symbol} trade WON: +${profit:,.2f} | "
+                f"Streak reset to 0 | Daily PnL: ${sym_pnl:+,.2f}"
+            )
+        else:
+            loss_streak = self._consecutive_losses.get(symbol, 0) + 1
+            self._consecutive_losses[symbol] = loss_streak
+            logger.warning(
+                f"⚠️ [RISK AUDIT] {symbol} trade LOST: -${abs(profit):,.2f} ({comment}) | "
+                f"Loss Streak: {loss_streak} | Daily PnL: ${sym_pnl:+,.2f}"
+            )
+
+            # Check if breached per-symbol daily loss cap
+            if sym_pnl <= -self.max_daily_loss_per_symbol_usd:
+                self._symbol_locked_for_day[symbol] = True
+                logger.critical(
+                    f"🛑 [SYMBOL LOCKOUT] {symbol} locked for rest of UTC day: "
+                    f"Daily loss ${sym_pnl:+,.2f} breached cap -${self.max_daily_loss_per_symbol_usd:,.2f}"
+                )
+                return
+
+            # Exponential backoff cooldown ladder: [300s (5m), 2700s (45m), -1 (Lock)]
+            if loss_streak == 1:
+                dur = self.consecutive_loss_cooldowns[0] if len(self.consecutive_loss_cooldowns) > 0 else 300.0
+                self.trigger_cooldown(symbol, duration_sec=dur, reason=f"Loss #1 on {symbol}")
+            elif loss_streak == 2:
+                dur = self.consecutive_loss_cooldowns[1] if len(self.consecutive_loss_cooldowns) > 1 else 2700.0
+                self.trigger_cooldown(symbol, duration_sec=dur, reason=f"Loss #2 consecutive on {symbol} (Deep Backoff 45m)")
+            else:
+                self._symbol_locked_for_day[symbol] = True
+                logger.critical(
+                    f"🛑 [SYMBOL LOCKOUT] {symbol} locked for rest of UTC day after {loss_streak} consecutive losses."
+                )
+
     def get_risk_multiplier(self, current_equity: float) -> float:
         """
         Nautilus Trader Drawdown Ladder De-Risking:
@@ -184,4 +250,7 @@ class CentralRiskDesk:
         self._is_halted = False
         self._halt_reason = ""
         self._symbol_cooldowns.clear()
+        self._consecutive_losses.clear()
+        self._daily_symbol_pnl.clear()
+        self._symbol_locked_for_day.clear()
         logger.info("[RISK] Central Risk Desk manually unlocked.")

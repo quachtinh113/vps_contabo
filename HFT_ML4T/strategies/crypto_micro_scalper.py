@@ -16,6 +16,7 @@ from engines.ml4t_meta_labeler import (
     calculate_garman_klass_volatility,
     calculate_triple_barriers,
     MLMetaGatekeeper,
+    calculate_macro_regime_slope,
     calculate_macro_trend_ema200
 )
 from engines.position_sizer import PositionSizer
@@ -115,15 +116,37 @@ class CryptoMicroScalperStrategy:
         if not action:
             return None
 
-        # 5. Institutional H1 Macro Trend Filter (EMA200 Hard Gate) — Áp dụng triệt để
-        ema200_val = ema200_h1 if ema200_h1 is not None else calculate_macro_trend_ema200(rates_df, h1_df)
-        if ema200_val is not None:
-            if action == "BUY" and mid_price < ema200_val:
-                logger.debug(f"[BTC_ORACLE] VETO BUY: Price {mid_price} < H1 EMA200 {ema200_val:.2f} (Bearish Macro Regime)")
+        # 5. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
+        macro_info = calculate_macro_regime_slope(rates_df, h1_df)
+        if macro_info.get("regime") != "UNKNOWN":
+            if action == "BUY":
+                if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
+                    logger.debug(
+                        f"[BTC_ORACLE] VETO BUY: H1 Macro Regime is Bearish or Slope < 0 "
+                        f"(EMA21: {macro_info.get('ema21', 0):.2f}, EMA50: {macro_info.get('ema50', 0):.2f}, Slope: {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    )
+                    return None
+            elif action == "SELL":
+                if macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03:
+                    logger.debug(
+                        f"[BTC_ORACLE] VETO SELL: H1 Macro Regime is Bullish or Slope > 0 "
+                        f"(EMA21: {macro_info.get('ema21', 0):.2f}, EMA50: {macro_info.get('ema50', 0):.2f}, Slope: {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    )
+                    return None
+        elif ema200_h1 is not None:
+            if action == "BUY" and mid_price < ema200_h1:
                 return None
-            elif action == "SELL" and mid_price > ema200_val:
-                logger.debug(f"[BTC_ORACLE] VETO SELL: Price {mid_price} > H1 EMA200 {ema200_val:.2f} (Bullish Macro Regime)")
+            elif action == "SELL" and mid_price > ema200_h1:
                 return None
+
+        # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)
+        ema20_m15 = float(rates_df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        if action == "BUY" and mid_price < ema20_m15 * 0.999:
+            logger.debug(f"[BTC_ORACLE] VETO BUY: Price {mid_price:.2f} below M15 EMA20 {ema20_m15:.2f} (Bearish Impulse)")
+            return None
+        elif action == "SELL" and mid_price > ema20_m15 * 1.001:
+            logger.debug(f"[BTC_ORACLE] VETO SELL: Price {mid_price:.2f} above M15 EMA20 {ema20_m15:.2f} (Bullish Impulse)")
+            return None
 
         # 6. ML Meta Gatekeeper Check
         sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
