@@ -72,9 +72,15 @@ class PositionSizer:
         # 4. Raw lot calculation
         raw_lot = risk_budget / loss_per_lot
 
-        # 5. Quantize to broker step
-        step_multiplier = round(raw_lot / lot_step)
+        # 5. Quantize to broker step (Conservative Floor to prevent risk budget overrun)
+        step_multiplier = math.floor((raw_lot + 1e-9) / lot_step)
         quantized_lot = step_multiplier * lot_step
+        if quantized_lot < min_lot:
+            if min_lot_risk <= (risk_budget * self.quantization_safety_buffer):
+                quantized_lot = min_lot
+            else:
+                return 0.0, f"Quantization Guard Rejected: Min lot exceeds budget (${risk_budget:.2f})"
+
         final_lot = max(min_lot, min(self.max_lot_cap, quantized_lot))
         final_lot = round(final_lot, 2)
 

@@ -91,6 +91,27 @@ class HFTSystemBacktester:
         if df is None or len(df) < 100:
             return {"symbol": sym, "error": f"Could not fetch bars for {sym}"}
 
+        # Compute H1 Macro Trend EMA200 strictly without lookahead bias
+        df_h1 = self.load_historical_data(sym, timeframe="H1", count=max(400, bars_count // 4 + 250))
+        if df_h1 is not None and len(df_h1) >= 50:
+            df_h1 = df_h1.sort_values("time").copy()
+            df_h1["ema200_h1"] = df_h1["close"].ewm(span=200, adjust=False).mean()
+            # H1 bar finishes at open time + 1 hour
+            df_h1["time_completed"] = pd.to_datetime(df_h1["time"] + pd.Timedelta(hours=1), utc=True).astype("datetime64[us, UTC]")
+            df = df.sort_values("time").copy()
+            df["time"] = pd.to_datetime(df["time"], utc=True).astype("datetime64[us, UTC]")
+            df = pd.merge_asof(
+                df,
+                df_h1[["time_completed", "ema200_h1"]],
+                left_on="time",
+                right_on="time_completed",
+                direction="backward"
+            )
+        else:
+            df = df.sort_values("time").copy()
+            df["time"] = pd.to_datetime(df["time"], utc=True).astype("datetime64[us, UTC]")
+            df["ema200_h1"] = df["close"].ewm(span=min(800, len(df)), adjust=False).mean().shift(1)
+
         sym_info = self.bridge.get_symbol_info(sym)
         contract_size = sym_info.trade_contract_size if sym_info else 100.0
         point = sym_info.point if sym_info else 0.00001
@@ -101,6 +122,8 @@ class HFTSystemBacktester:
         current_position = None
         cooldown_until_bar = 0
         profit_ladder_triggered_count = 0
+        loss_streak = 0
+        daily_loss = 0.0
 
         desk = CentralRiskDesk(
             max_daily_drawdown_usd=self.risk_cfg.get("max_daily_drawdown_usd", 300.0),
@@ -212,8 +235,27 @@ class HFTSystemBacktester:
                         "bars_held": bars_held
                     })
                     if net_pnl < 0:
-                        cooldown_until_bar = i + 4  # 4 bars cooldown (60 mins)
+                        loss_streak += 1
+                        daily_loss += abs(net_pnl)
+                        if daily_loss >= 80.0 or loss_streak >= 3:
+                            # Lock out symbol for remaining bars of the day
+                            curr_day = curr_bar["time"].date()
+                            day_end_bar = i
+                            while day_end_bar < len(df) and df.iloc[day_end_bar]["time"].date() == curr_day:
+                                day_end_bar += 1
+                            cooldown_until_bar = day_end_bar
+                        elif loss_streak == 2:
+                            cooldown_until_bar = i + 12  # 3 hours cooldown
+                        else:
+                            cooldown_until_bar = i + 4   # 1 hour cooldown
+                    else:
+                        loss_streak = 0
                     current_position = None
+
+            # Reset daily loss on new calendar day
+            if i > 0 and df.iloc[i]["time"].date() != df.iloc[i - 1]["time"].date():
+                daily_loss = 0.0
+                loss_streak = 0
 
             # 2. Check Cooldown
             if i < cooldown_until_bar or current_position is not None:
@@ -238,6 +280,14 @@ class HFTSystemBacktester:
                 "time": curr_bar["time"].timestamp()
             }
 
+            curr_ema200 = float(df["ema200_h1"].iloc[i]) if ("ema200_h1" in df.columns and pd.notna(df["ema200_h1"].iloc[i])) else None
+
+            prev_h1 = None
+            if df_h1 is not None and "time_completed" in df_h1.columns:
+                h1_idx = int(df_h1["time_completed"].searchsorted(curr_bar["time"], side="right"))
+                if h1_idx >= 25:
+                    prev_h1 = df_h1.iloc[:h1_idx]
+
             sig = strat.evaluate(
                 rates_df=prev_window,
                 market_snapshot=snapshot,
@@ -246,7 +296,9 @@ class HFTSystemBacktester:
                 contract_size=contract_size,
                 min_lot=0.01,
                 lot_step=0.01,
-                risk_multiplier=risk_mult
+                risk_multiplier=risk_mult,
+                h1_df=prev_h1,
+                ema200_h1=curr_ema200
             )
 
             if sig:

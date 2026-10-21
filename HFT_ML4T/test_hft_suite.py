@@ -32,8 +32,13 @@ from strategies.commodity_oil_scalper import OilMicroScalperStrategy
 from strategies.index_micro_scalper import IndexMicroScalperStrategy
 
 
+from engines.avellaneda_stoikov import AvellanedaStoikovEngine, calculate_order_flow_imbalance, calculate_micro_volatility
+
+
 def test_avellaneda_stoikov():
-    engine = AvellanedaStoikovEngine(gamma=0.1, kappa=1.5, ofi_sensitivity=0.25)
+    engine = AvellanedaStoikovEngine(gamma=0.1, kappa=1.5, ofi_sensitivity=0.25, max_inventory=5.0)
+    
+    # 1. Base test: Positive OFI shifts reservation price upwards
     quotes = engine.calculate_quotes(
         mid_price=2650.0,
         inventory_q=0.0,
@@ -43,7 +48,57 @@ def test_avellaneda_stoikov():
     )
     assert quotes["reservation_price"] > 2650.0, "Positive OFI should shift reservation price upwards"
     assert quotes["optimal_ask"] > quotes["optimal_bid"], "Ask must be higher than Bid"
-    print("✅ test_avellaneda_stoikov PASSED")
+    assert quotes["allow_bid"] and quotes["allow_ask"], "Both quotes must be allowed when flat"
+
+    # 2. Symmetrical case (q = 0, OFI = 0) -> r == s
+    quotes_flat = engine.calculate_quotes(
+        mid_price=2650.0, inventory_q=0.0, volatility_sigma=0.005, order_flow_imbalance=0.0
+    )
+    assert quotes_flat["reservation_price"] == 2650.0, "Flat inventory with zero OFI must equal mid price"
+
+    # 3. Inventory skewing (q = +3.0 Long) -> r < s (shifts down to dump long inventory)
+    quotes_long = engine.calculate_quotes(
+        mid_price=2650.0, inventory_q=3.0, volatility_sigma=0.005, order_flow_imbalance=0.0
+    )
+    assert quotes_long["reservation_price"] < 2650.0, "Long inventory must skew reservation price downward"
+    assert quotes_long["optimal_ask"] < quotes_flat["optimal_ask"], "Ask must drop to incentivize closing Long"
+
+    # 4. Inventory skewing (q = -3.0 Short) -> r > s (shifts up to cover short inventory)
+    quotes_short = engine.calculate_quotes(
+        mid_price=2650.0, inventory_q=-3.0, volatility_sigma=0.005, order_flow_imbalance=0.0
+    )
+    assert quotes_short["reservation_price"] > 2650.0, "Short inventory must skew reservation price upward"
+    assert quotes_short["optimal_bid"] > quotes_flat["optimal_bid"], "Bid must rise to incentivize covering Short"
+
+    # 5. Dynamic Kappa: Low volume widens spread
+    quotes_normal = engine.calculate_quotes(
+        mid_price=2650.0, inventory_q=0.0, volatility_sigma=0.005, volume_ratio=1.0
+    )
+    quotes_thin = engine.calculate_quotes(
+        mid_price=2650.0, inventory_q=0.0, volatility_sigma=0.005, volume_ratio=0.3
+    )
+    assert quotes_thin["dynamic_kappa"] < quotes_normal["dynamic_kappa"], "Kappa must drop in thin liquidity"
+    assert quotes_thin["spread"] > quotes_normal["spread"], "Spread must widen in thin liquidity"
+
+    # 6. Hard Inventory Circuit Breaker
+    quotes_max_long = engine.calculate_quotes(
+        mid_price=2650.0, inventory_q=5.0, volatility_sigma=0.005, max_inventory=5.0
+    )
+    assert not quotes_max_long["allow_bid"], "Must suppress BUY when max long inventory is reached"
+    assert quotes_max_long["allow_ask"], "Must keep ASK enabled to unwind inventory"
+
+    quotes_max_short = engine.calculate_quotes(
+        mid_price=2650.0, inventory_q=-5.0, volatility_sigma=0.005, max_inventory=5.0
+    )
+    assert not quotes_max_short["allow_ask"], "Must suppress SELL when max short inventory is reached"
+    assert quotes_max_short["allow_bid"], "Must keep BID enabled to cover short"
+
+    # 7. Micro-Volatility Estimator
+    prices = [2650.0 + i * 0.1 for i in range(100)]
+    micro_vol = calculate_micro_volatility(prices, window=60)
+    assert micro_vol > 0.0, "Micro-volatility must be positive"
+
+    print("✅ test_avellaneda_stoikov (Institutional 7-Point Matrix) PASSED")
 
 
 def test_position_sizer():
@@ -74,7 +129,7 @@ def test_quantization_guard():
 
 
 def test_central_risk_desk():
-    desk = CentralRiskDesk(max_daily_drawdown_usd=200.0, max_daily_drawdown_pct=0.05)
+    desk = CentralRiskDesk(max_daily_drawdown_usd=200.0, max_daily_drawdown_pct=0.05, rollover_curfew_utc=("00:00", "00:00"))
     desk.update_account_state({"equity": 10000.0, "margin_level": 500.0, "margin": 100.0})
     
     # 1. Normal pre-trade
@@ -106,6 +161,7 @@ def test_central_risk_desk():
         account_info={"equity": 9700.0, "margin_level": 500.0, "margin": 100.0}  # -$300 DD > $200 limit
     )
     assert not safe_dd, "Should trigger Circuit Breaker on drawdown breach"
+    desk.manual_unlock()
     print("✅ test_central_risk_desk PASSED")
 
 

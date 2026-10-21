@@ -16,10 +16,31 @@ risk_desk:
   max_total_open_positions: 6      # Global concurrent position limit across all assets
   max_positions_per_symbol: 1      # Max 1 concurrent position per asset
   rollover_curfew_utc: ["21:45", "22:30"]  # Exness daily rollover spread freeze
-  post_sl_cooldown_seconds: 240    # Cooldown 4 phút sau khi dính SL để triệt tiêu Whipsaw
+  post_sl_cooldown_seconds: 300    # Base Cooldown (5 phút)
+  max_daily_loss_per_symbol_usd: 80.0      # Hạn mức chịu lỗ tối đa cho từng Symbol ($80/ngày)
+  consecutive_loss_cooldowns: [300, 2700, -1] # Cooldown lũy tiến: 5m -> 45m -> Khóa symbol hết ngày
+  max_trailing_drawdown_pct: 0.08          # 8.0% All-time High-Water Mark Trailing Drawdown Guard
+  max_positions_per_cluster: 2             # Tối đa 2 vị thế mở cùng 1 nhóm tài sản (Metals, Crypto, FX...)
+  auto_write_halt_file: true               # Tự động ghi file HALT_HFT vật lý khi chạm Circuit Breaker
   
-  # Nautilus Dynamic Profit Locking Ladder:
-  enable_profit_ladder: true       # Thay thế Breakeven trap bằng Profit Locking Ladder
+  # Tier 3: Matrix Risk & Pod Drawdown Recovery (3 consecutive losses -> 24h lockout + 50% recovery sizing)
+  pod_drawdown:
+    enabled: true
+    consecutive_loss_threshold: 3 # Chuỗi 3 lệnh thua liên tiếp
+    lockout_duration_hours: 24.0  # Tạm dừng giao dịch cặp đó 24 giờ để bão hòa vùng nhiễu
+    recovery_trades_count: 5      # 5 lệnh tiếp theo trong chế độ phục hồi
+    recovery_lot_multiplier: 0.50 # Giảm 50% volume (0.5x lot) trong 5 lệnh phục hồi
+
+  # Tier 1: Dynamic ATR Trailing Stop & Expectancy Engine
+  trailing_stop:
+    enabled: true
+    mode: "atr_dynamic"           # ATR-based Dynamic Trailing Stop
+    atr_multiplier: 1.5           # Biên độ đệm 1.5x ATR
+    min_gain_ratio: 0.60          # Kích hoạt khi lãi đạt 60% TP distance hoặc 1.5x ATR
+    guarantee_breakeven: true     # Không bao giờ kéo SL dưới điểm hòa vốn + phí spread
+
+  # Nautilus Dynamic Profit Locking Ladder (Legacy Fallback):
+  enable_profit_ladder: true       # Dự phòng bậc thang
   profit_ladder:
     tier1_trigger_ratio: 0.50      # Khi lãi đạt 50% TP distance
     tier1_lock_ratio: 0.25         # Khóa +25% TP distance làm lợi nhuận chắc chắn
@@ -29,7 +50,7 @@ risk_desk:
 
 symbols:
   # ===================================================================
-  # PILLAR 1: Sovereign Crypto Champion (Bitcoin) — Rank S
+  # PILLAR 1: Sovereign Crypto Champion (Bitcoin) — Khử nhiễu Order Flow ban đêm & Đa khung
   # ===================================================================
   - name: "BTCUSDm"
     enabled: true
@@ -40,15 +61,31 @@ symbols:
     sl_multiplier: 1.5
     tp_multiplier: 3.2             # Tỷ lệ R:R 1:2.13
     position_sizing:
-      risk_per_trade_pct: 0.005    # 0.5% risk per trade (~$53 budget)
-      max_lot_cap: 0.10            # Tối đa 0.10 BTC
+      risk_per_trade_pct: 0.003    # Giảm từ 0.5% xuống 0.3% để hạn chế drawdown
+      max_lot_cap: 0.05            # Giảm từ 0.10 xuống 0.05 BTC
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 1.5
       ofi_sensitivity: 0.25
+      ofi_threshold: 0.25          # Nới lỏng từ 0.35 về 0.25 để bắt vi xung lực
+      ofi_night_threshold: 0.30    # Ngưỡng OFI ban đêm giảm từ 0.40 về 0.30
+    volume_filter:
+      enabled: true
+      sma_period: 20               # Volume >= 0.9 * SMA(Volume, 20)
+      min_multiplier: 0.9          # Nới lỏng từ 1.2 xuống 0.9 chống nghẽn lệnh
+    night_window_utc: ["20:00", "02:00"] # Khung giờ thanh khoản mỏng ban đêm
+    multi_tf_consensus:
+      enabled: true                # Tier 2: Chỉ vào lệnh khi H1 và H4 đồng thuận xu hướng
+      h1_ema_fast: 50
+      h1_ema_slow: 200
+    profit_ladder:
+      tier1_trigger_ratio: 0.65    # Nới lỏng từ 50% lên 65% TP chống rung lắc quét SL non
+      tier1_lock_ratio: 0.25
+      tier2_trigger_ratio: 0.85
+      tier2_lock_ratio: 0.50
 
   # ===================================================================
-  # PILLAR 2: Precious Metal Champion (Gold) — Rank A
+  # PILLAR 2: Precious Metal Champion (Gold) — Phiên Âu/Mỹ & Session-Aware ATR
   # ===================================================================
   - name: "XAUUSDm"
     enabled: true
@@ -56,18 +93,31 @@ symbols:
     magic: 777001
     timeframe: "M15"
     max_spread_points: 350.0       # Max allowable spread in points (~35 pips / $0.35)
+    trading_session_utc: ["07:00", "21:00"] # Tier 2: Đứng ngoài phiên Á, chỉ giao dịch phiên Âu - Mỹ
     sl_multiplier: 1.5
-    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Tối ưu hóa từ Win rate 60.4%)
+    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0
     position_sizing:
-      risk_per_trade_pct: 0.005    # 0.5% risk per trade
-      max_lot_cap: 0.10
+      risk_per_trade_pct: 0.004    # 0.4% risk per trade an toàn
+      max_lot_cap: 0.05            # Khống chế 0.05 lot an toàn cho Vàng (0.01 - 0.02 lot phiên Mỹ)
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 1.5
       ofi_sensitivity: 0.25
+    session_aware_atr:
+      enabled: true
+      asia_europe_utc: ["07:00", "12:00"] # Đã giới hạn sau 07:00 UTC
+      asia_europe_sl_mult: 1.5     # Phiên Âu: SL Multiplier = 1.5x ATR
+      us_session_utc: ["12:00", "21:00"]
+      us_session_sl_mult: 2.2      # Phiên Mỹ: SL Multiplier = 2.2x ATR
+      tp_rr_ratio: 2.0             # Bảo toàn tỷ lệ TP/SL = 2.0 (Volatility Sizing Invariant)
+    profit_ladder:
+      tier1_trigger_ratio: 0.50    # Duy trì nguyên trạng chiến lược đã mang lại PnL dương
+      tier1_lock_ratio: 0.25
+      tier2_trigger_ratio: 0.75
+      tier2_lock_ratio: 0.50
 
   # ===================================================================
-  # PILLAR 3: Commodity Energy Champion (Crude Oil WTI) — Rank A+
+  # PILLAR 3: Commodity Energy Champion (Crude Oil WTI) — Đồng thuận xu hướng đa khung
   # ===================================================================
   - name: "USOILm"
     enabled: true
@@ -76,17 +126,26 @@ symbols:
     timeframe: "M15"
     max_spread_points: 35.0        # Max allowable spread in points (~0.035$, normal spread is 20 pts)
     sl_multiplier: 1.5
-    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Tối ưu hóa từ Win rate 66.2%)
+    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Win rate 61.3%)
     position_sizing:
-      risk_per_trade_pct: 0.005    # 0.5% risk per trade
-      max_lot_cap: 0.08            # Tối đa 0.08 lot (80 thùng)
+      risk_per_trade_pct: 0.007    # Tăng từ 0.5% lên 0.7% vốn để tối đa hóa lợi nhuận
+      max_lot_cap: 0.12            # Tăng từ 0.08 lên 0.12 lot (120 thùng)
     avellaneda_stoikov:
       gamma: 0.12
       kappa: 1.8
       ofi_sensitivity: 0.25
+    multi_tf_consensus:
+      enabled: true                # Tier 2: Chỉ mở lệnh M15 khi xu hướng H1 và H4 đồng thuận
+      h1_ema_fast: 50
+      h1_ema_slow: 200
+    profit_ladder:
+      tier1_trigger_ratio: 0.65    # Nới lỏng từ 50% lên 65% TP chống rung lắc quét SL non
+      tier1_lock_ratio: 0.25
+      tier2_trigger_ratio: 0.85
+      tier2_lock_ratio: 0.50
 
   # ===================================================================
-  # PILLAR 4: US Equity Index Champion (Dow Jones 30) — Rank S-
+  # PILLAR 4: US Equity Index Champion (Dow Jones 30) — H1 Trend & Pullback Filter
   # ===================================================================
   - name: "US30m"
     enabled: true
@@ -94,21 +153,31 @@ symbols:
     magic: 777006
     timeframe: "M15"
     max_spread_points: 25.0        # Max allowable spread in points (~2.5$, normal spread is 10 pts)
+    trading_session_utc: ["13:00", "21:00"] # Session Filter: Chỉ áp dụng riêng cho US30m (Phiên Mỹ New York)
     sl_multiplier: 1.5
-    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87
+    tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87 (Win rate 55.4%)
     position_sizing:
-      risk_per_trade_pct: 0.005    # 0.5% risk per trade
-      max_lot_cap: 0.20            # Tối đa 0.20 lot
+      risk_per_trade_pct: 0.005    # 0.5% vốn
+      max_lot_cap: 0.15            # Hạ từ 0.25 xuống 0.15 lot phòng thủ phiên Mỹ
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 1.6
       ofi_sensitivity: 0.25
+    trend_filter:
+      h1_ema_period: 50            # Close_H1 > EMA50_H1 or Close_H1 > DonchianMid_H1
+      donchian_period: 20          # Chu kỳ Donchian Channel trên H1
+      block_consecutive_impulse: 2 # Chặn bắt dao rơi khi nến M15 xả thẳng đứng
+    profit_ladder:
+      tier1_trigger_ratio: 0.50    # Duy trì nguyên trạng chiến lược (PF 1.78)
+      tier1_lock_ratio: 0.25
+      tier2_trigger_ratio: 0.75
+      tier2_lock_ratio: 0.50
 
   # ===================================================================
-  # DEFENSIVE ALLOCATION: Major Forex Pairs (Tạm dừng để triệt tiêu hao mòn spread)
+  # PILLAR 5 & 6: Major Forex Pairs (Thanh khoản cao, spread siêu mỏng 6-12 pts)
   # ===================================================================
   - name: "EURUSDm"
-    enabled: false                 # Tạm tắt để triệt tiêu hao mòn spread M15
+    enabled: true                  # Bật lại để khai thác vi mô phiên London/New York
     strategy_type: "fx"
     magic: 777003
     timeframe: "M15"
@@ -124,7 +193,7 @@ symbols:
       ofi_sensitivity: 0.25
 
   - name: "GBPUSDm"
-    enabled: false                 # Tạm tắt để triệt tiêu hao mòn spread M15
+    enabled: true                  # Bật lại để khai thác vi mô phiên London/New York
     strategy_type: "fx"
     magic: 777002
     timeframe: "M15"

@@ -5,11 +5,19 @@ Order Flow Imbalance (OFI), Garman-Klass volatility, and Triple-Barrier risk gat
 """
 
 from typing import Dict, Any, Optional
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 
 from engines.avellaneda_stoikov import AvellanedaStoikovEngine, calculate_order_flow_imbalance
-from engines.ml4t_meta_labeler import CUSUMEventFilter, calculate_garman_klass_volatility, calculate_triple_barriers, MLMetaGatekeeper
+from engines.ml4t_meta_labeler import (
+    CUSUMEventFilter,
+    calculate_garman_klass_volatility,
+    calculate_triple_barriers,
+    MLMetaGatekeeper,
+    calculate_macro_regime_slope,
+    calculate_macro_trend_ema200
+)
 from engines.position_sizer import PositionSizer
 from core.audit_logger import get_logger
 
@@ -23,6 +31,7 @@ class OilMicroScalperStrategy:
     - Avellaneda-Stoikov reservation price dynamics calibrated for commodity momentum.
     - CUSUM Event Filter detects intraday energy breakout shocks.
     - ML Meta Gatekeeper rejects toxic chop and spread-widening windows.
+    - Strict H1 Macro Trend Filter (EMA200 Hard Gate).
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -56,7 +65,9 @@ class OilMicroScalperStrategy:
         contract_size: float = 1000.0,
         min_lot: float = 0.01,
         lot_step: float = 0.01,
-        risk_multiplier: float = 1.0
+        risk_multiplier: float = 1.0,
+        h1_df: Optional[pd.DataFrame] = None,
+        ema200_h1: Optional[float] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluates incoming market data for an optimal HFT order on Crude Oil.
@@ -104,7 +115,58 @@ class OilMicroScalperStrategy:
         if not action:
             return None
 
-        # 5. ML Meta Gatekeeper Check
+        # 4.5 Hard Inventory Quoting Circuit Breaker
+        if action == "BUY" and not quotes.get("allow_bid", True):
+            logger.info(
+                f"🛡️ [AS CIRCUIT BREAKER] {self.symbol} BUY rejected: Inventory cap reached ({current_inventory:.2f} >= {quotes.get('max_inventory', 5.0):.2f})"
+            )
+            return None
+        elif action == "SELL" and not quotes.get("allow_ask", True):
+            logger.info(
+                f"🛡️ [AS CIRCUIT BREAKER] {self.symbol} SELL rejected: Short inventory cap reached ({current_inventory:.2f} <= -{quotes.get('max_inventory', 5.0):.2f})"
+            )
+            return None
+
+        # 5. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
+        macro_info = calculate_macro_regime_slope(rates_df, h1_df)
+        if macro_info.get("regime") != "UNKNOWN":
+            if action == "BUY":
+                if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(BUY rejected: H1 Bearish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    )
+                    return None
+            elif action == "SELL":
+                if macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03:
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(SELL rejected: H1 Bullish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    )
+                    return None
+
+        # Tier 2: Multi-Timeframe Trend Consensus (H1 & H4 Alignment)
+        if h1_df is not None and len(h1_df) >= 50:
+            h1_close = float(h1_df["close"].iloc[-1])
+            h1_ema50 = float(h1_df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            h1_ema200 = float(h1_df["close"].ewm(span=200, adjust=False).mean().iloc[-1]) if len(h1_df) >= 100 else h1_ema50
+            if action == "BUY" and not (h1_close > h1_ema50 and h1_ema50 >= h1_ema200 * 0.998):
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (BUY rejected: H1 Close/EMA50 below EMA200)")
+                return None
+            elif action == "SELL" and not (h1_close < h1_ema50 and h1_ema50 <= h1_ema200 * 1.002):
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (SELL rejected: H1 Close/EMA50 above EMA200)")
+                return None
+
+        # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)
+        ema20_m15 = float(rates_df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        if action == "BUY" and mid_price < ema20_m15 * 0.999:
+            logger.debug(f"[OIL_BLACKGOLD] VETO BUY: Price {mid_price:.2f} below M15 EMA20 {ema20_m15:.2f} (Bearish Impulse)")
+            return None
+        elif action == "SELL" and mid_price > ema20_m15 * 1.001:
+            logger.debug(f"[OIL_BLACKGOLD] VETO SELL: Price {mid_price:.2f} above M15 EMA20 {ema20_m15:.2f} (Bullish Impulse)")
+            return None
+
+        # 6. ML Meta Gatekeeper Check
         sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
         trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         
