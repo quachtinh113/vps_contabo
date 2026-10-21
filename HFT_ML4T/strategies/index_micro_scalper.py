@@ -146,6 +146,18 @@ class IndexMicroScalperStrategy:
         if not action:
             return None
 
+        # 4.5 Hard Inventory Quoting Circuit Breaker
+        if action == "BUY" and not quotes.get("allow_bid", True):
+            logger.info(
+                f"🛡️ [AS CIRCUIT BREAKER] {self.symbol} BUY rejected: Inventory cap reached ({current_inventory:.2f} >= {quotes.get('max_inventory', 5.0):.2f})"
+            )
+            return None
+        elif action == "SELL" and not quotes.get("allow_ask", True):
+            logger.info(
+                f"🛡️ [AS CIRCUIT BREAKER] {self.symbol} SELL rejected: Short inventory cap reached ({current_inventory:.2f} <= -{quotes.get('max_inventory', 5.0):.2f})"
+            )
+            return None
+
         # 5. Mandatory H1 Trend Filter (Close_H1 > EMA50_H1 OR Close_H1 > DonchianMid_H1)
         if h1_df is not None and len(h1_df) >= max(self.h1_ema_period, self.donchian_period):
             close_h1 = float(h1_df["close"].iloc[-1])

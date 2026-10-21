@@ -115,6 +115,18 @@ class OilMicroScalperStrategy:
         if not action:
             return None
 
+        # 4.5 Hard Inventory Quoting Circuit Breaker
+        if action == "BUY" and not quotes.get("allow_bid", True):
+            logger.info(
+                f"🛡️ [AS CIRCUIT BREAKER] {self.symbol} BUY rejected: Inventory cap reached ({current_inventory:.2f} >= {quotes.get('max_inventory', 5.0):.2f})"
+            )
+            return None
+        elif action == "SELL" and not quotes.get("allow_ask", True):
+            logger.info(
+                f"🛡️ [AS CIRCUIT BREAKER] {self.symbol} SELL rejected: Short inventory cap reached ({current_inventory:.2f} <= -{quotes.get('max_inventory', 5.0):.2f})"
+            )
+            return None
+
         # 5. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
         macro_info = calculate_macro_regime_slope(rates_df, h1_df)
         if macro_info.get("regime") != "UNKNOWN":

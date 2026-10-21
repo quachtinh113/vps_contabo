@@ -108,8 +108,46 @@ class CentralRiskDesk:
                 return cluster_name
         return None
 
+    def check_and_reset_daily_halt(self) -> bool:
+        """
+        Auto-resets HALT_HFT lockfile on new UTC day ONLY if the halt was caused by Daily Drawdown.
+        Catastrophic halts (Margin Depletion, Trailing Max Drawdown) remain strictly locked.
+        """
+        if not self.halt_file.exists():
+            return True
+
+        try:
+            content = self.halt_file.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.error(f"Failed to read halt file {self.halt_file}: {e}")
+            return False
+
+        # Only auto-clear if breach reason was Daily Drawdown
+        if "Daily Drawdown Hard Limit breached" in content:
+            creation_time = self.halt_file.stat().st_mtime
+            halt_date = datetime.fromtimestamp(creation_time, tz=timezone.utc).date()
+            current_utc_date = datetime.now(timezone.utc).date()
+
+            if current_utc_date > halt_date:
+                try:
+                    self.halt_file.unlink()
+                    self._is_halted = False
+                    self._halt_reason = ""
+                    self._current_derisk_tier = 1.0
+                    logger.info(
+                        f"🌅 [RISK DESK] Auto-cleared Daily Drawdown HALT_HFT for new trading day: {current_utc_date}. "
+                        f"System unhalted and ready for new session."
+                    )
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to auto-remove halt file {self.halt_file}: {e}")
+                    return False
+        return False
+
     def update_account_state(self, account_info: Dict[str, Any]) -> None:
         """Tracks daily peak equity & all-time HWM and resets peak & symbol counters on UTC midnight."""
+        self.check_and_reset_daily_halt()
+
         now_utc = datetime.now(timezone.utc)
         today_str = now_utc.strftime("%Y-%m-%d")
 
@@ -144,7 +182,9 @@ class CentralRiskDesk:
         Executes pre-flight institutional risk checks before any order is submitted.
         Returns (is_approved: bool, reason: str).
         """
-        # 1. Manual Kill-Switch Check
+        # 1. Manual Kill-Switch Check (With Auto Daily Reset for prior day Daily DD)
+        self.check_and_reset_daily_halt()
+
         if self.halt_file.exists():
             self._is_halted = True
             self._halt_reason = f"Kill-switch file detected: {self.halt_file.name}"

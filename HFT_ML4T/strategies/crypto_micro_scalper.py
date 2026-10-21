@@ -5,6 +5,7 @@ Order Flow Imbalance (OFI), Garman-Klass volatility, and Triple-Barrier risk gat
 Supports 24/7 high-frequency execution.
 """
 
+import time
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 import pandas as pd
@@ -65,6 +66,14 @@ class CryptoMicroScalperStrategy:
             risk_per_trade_pct=sizing_cfg.get("risk_per_trade_pct", 0.005),
             max_lot_cap=sizing_cfg.get("max_lot_cap", 0.10)
         )
+        self._last_log_times: Dict[str, float] = {}
+
+    def _log_throttled(self, key: str, msg: str, interval: float = 900.0) -> None:
+        """Throttles high-frequency rejection logs to prevent disk I/O spam."""
+        now_ts = time.time()
+        if now_ts - self._last_log_times.get(key, 0.0) >= interval:
+            self._last_log_times[key] = now_ts
+            logger.info(msg)
 
     def evaluate(
         self,
@@ -91,12 +100,16 @@ class CryptoMicroScalperStrategy:
         if mid_price <= 0 or spread_pts > self.max_spread_points:
             return None
 
-        # 0. Volume Filter: Volume >= 1.2 * SMA(Volume, 20)
-        if self.volume_filter_enabled and "tick_volume" in rates_df.columns and len(rates_df) >= (self.volume_sma_period + 1):
+        # 0. Volume Filter: Volume >= min_multiplier * SMA(Volume, 20)
+        vol_ratio = 1.0
+        if "tick_volume" in rates_df.columns and len(rates_df) >= (self.volume_sma_period + 1):
             curr_vol = float(rates_df["tick_volume"].iloc[-1])
             vol_sma20 = float(rates_df["tick_volume"].iloc[-(self.volume_sma_period + 1):-1].mean())
-            if vol_sma20 > 0 and curr_vol < (self.volume_min_multiplier * vol_sma20):
-                logger.info(
+            if vol_sma20 > 0:
+                vol_ratio = curr_vol / vol_sma20
+            if self.volume_filter_enabled and vol_sma20 > 0 and curr_vol < (self.volume_min_multiplier * vol_sma20):
+                self._log_throttled(
+                    "LOW_VOLUME",
                     f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: LOW_VOLUME "
                     f"(Vol: {curr_vol:.0f} < {self.volume_min_multiplier:.1f}x SMA20: {self.volume_min_multiplier * vol_sma20:.0f})"
                 )
@@ -127,13 +140,14 @@ class CryptoMicroScalperStrategy:
         is_night_window = (curr_hour >= 20 or curr_hour < 2)
         req_ofi = self.ofi_night_threshold if is_night_window else self.ofi_threshold
 
-        # 3. Avellaneda-Stoikov Reservation Pricing
+        # 3. Avellaneda-Stoikov Reservation Pricing (with Dynamic Kappa & Inventory Guard)
         quotes = self.as_engine.calculate_quotes(
             mid_price=mid_price,
             inventory_q=current_inventory,
             volatility_sigma=volatility,
             time_remaining_t=1.0,
-            order_flow_imbalance=ofi
+            order_flow_imbalance=ofi,
+            volume_ratio=vol_ratio
         )
         reservation_price = quotes["reservation_price"]
         skew_offset = quotes["skew_offset"]
@@ -154,7 +168,8 @@ class CryptoMicroScalperStrategy:
         else:
             if (skew_offset > vol_threshold and ofi > 0) or (skew_offset < -vol_threshold and ofi < 0) or is_event:
                 if abs(ofi) < req_ofi:
-                    logger.info(
+                    self._log_throttled(
+                        "OFI_BELOW_THRESHOLD",
                         f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: OFI_BELOW_THRESHOLD "
                         f"(OFI: {ofi:+.3f} < {req_ofi:.2f}{' [NIGHT_WINDOW]' if is_night_window else ''})"
                     )
@@ -163,29 +178,45 @@ class CryptoMicroScalperStrategy:
         if not action:
             return None
 
+        # 4.5 Hard Inventory Quoting Circuit Breaker
+        if action == "BUY" and not quotes.get("allow_bid", True):
+            self._log_throttled(
+                "HARD_INVENTORY_CAP_LONG",
+                f"🛡️ [AS CIRCUIT BREAKER] {self.symbol} BUY rejected: Inventory cap reached ({current_inventory:.2f} >= {quotes.get('max_inventory', 5.0):.2f})"
+            )
+            return None
+        elif action == "SELL" and not quotes.get("allow_ask", True):
+            self._log_throttled(
+                "HARD_INVENTORY_CAP_SHORT",
+                f"🛡️ [AS CIRCUIT BREAKER] {self.symbol} SELL rejected: Short inventory cap reached ({current_inventory:.2f} <= -{quotes.get('max_inventory', 5.0):.2f})"
+            )
+            return None
+
         # 5. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
         macro_info = calculate_macro_regime_slope(rates_df, h1_df)
         if macro_info.get("regime") != "UNKNOWN":
             if action == "BUY":
                 if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
-                    logger.info(
+                    self._log_throttled(
+                        "H1_TREND_MISMATCH",
                         f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
                         f"(BUY rejected: H1 Bearish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
                     )
                     return None
             elif action == "SELL":
                 if macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03:
-                    logger.info(
+                    self._log_throttled(
+                        "H1_TREND_MISMATCH",
                         f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
                         f"(SELL rejected: H1 Bullish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
                     )
                     return None
         elif ema200_h1 is not None:
             if action == "BUY" and mid_price < ema200_h1:
-                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected below H1 EMA200)")
+                self._log_throttled("H1_TREND_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected below H1 EMA200)")
                 return None
             elif action == "SELL" and mid_price > ema200_h1:
-                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected above H1 EMA200)")
+                self._log_throttled("H1_TREND_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected above H1 EMA200)")
                 return None
 
         # Tier 2: Multi-Timeframe Trend Consensus (H1 & H4 Alignment)
@@ -194,19 +225,19 @@ class CryptoMicroScalperStrategy:
             h1_ema50 = float(h1_df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
             h1_ema200 = float(h1_df["close"].ewm(span=200, adjust=False).mean().iloc[-1]) if len(h1_df) >= 100 else h1_ema50
             if action == "BUY" and not (h1_close > h1_ema50 and h1_ema50 >= h1_ema200 * 0.995):
-                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (BUY rejected: H1 Close/EMA50 below EMA200)")
+                self._log_throttled("MULTI_TF_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (BUY rejected: H1 Close/EMA50 below EMA200)")
                 return None
             elif action == "SELL" and not (h1_close < h1_ema50 and h1_ema50 <= h1_ema200 * 1.005):
-                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (SELL rejected: H1 Close/EMA50 above EMA200)")
+                self._log_throttled("MULTI_TF_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (SELL rejected: H1 Close/EMA50 above EMA200)")
                 return None
 
         # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)
         ema20_m15 = float(rates_df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
         if action == "BUY" and mid_price < ema20_m15 * 0.999:
-            logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected: Price below M15 EMA20)")
+            self._log_throttled("H1_TREND_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected: Price below M15 EMA20)")
             return None
         elif action == "SELL" and mid_price > ema20_m15 * 1.001:
-            logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected: Price above M15 EMA20)")
+            self._log_throttled("H1_TREND_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected: Price above M15 EMA20)")
             return None
 
         # 6. ML Meta Gatekeeper Check

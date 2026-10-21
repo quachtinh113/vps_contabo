@@ -67,12 +67,12 @@ symbols:
       gamma: 0.10
       kappa: 1.5
       ofi_sensitivity: 0.25
-      ofi_threshold: 0.35          # Nâng ngưỡng kích hoạt OFI từ 0.25 lên 0.35
-      ofi_night_threshold: 0.40    # Ngưỡng OFI ban đêm (20:00 - 02:00 UTC) tăng thêm +0.05
+      ofi_threshold: 0.25          # Nới lỏng từ 0.35 về 0.25 để bắt vi xung lực
+      ofi_night_threshold: 0.30    # Ngưỡng OFI ban đêm giảm từ 0.40 về 0.30
     volume_filter:
       enabled: true
-      sma_period: 20               # Volume >= 1.2 * SMA(Volume, 20)
-      min_multiplier: 1.2
+      sma_period: 20               # Volume >= 0.9 * SMA(Volume, 20)
+      min_multiplier: 0.9          # Nới lỏng từ 1.2 xuống 0.9 chống nghẽn lệnh
     night_window_utc: ["20:00", "02:00"] # Khung giờ thanh khoản mỏng ban đêm
     multi_tf_consensus:
       enabled: true                # Tier 2: Chỉ vào lệnh khi H1 và H4 đồng thuận xu hướng
@@ -174,10 +174,10 @@ symbols:
       tier2_lock_ratio: 0.50
 
   # ===================================================================
-  # DEFENSIVE ALLOCATION: Major Forex Pairs (Tạm dừng để triệt tiêu hao mòn spread)
+  # PILLAR 5 & 6: Major Forex Pairs (Thanh khoản cao, spread siêu mỏng 6-12 pts)
   # ===================================================================
   - name: "EURUSDm"
-    enabled: false                 # Tạm tắt để triệt tiêu hao mòn spread M15
+    enabled: true                  # Bật lại để khai thác vi mô phiên London/New York
     strategy_type: "fx"
     magic: 777003
     timeframe: "M15"
@@ -193,7 +193,7 @@ symbols:
       ofi_sensitivity: 0.25
 
   - name: "GBPUSDm"
-    enabled: false                 # Tạm tắt để triệt tiêu hao mòn spread M15
+    enabled: true                  # Bật lại để khai thác vi mô phiên London/New York
     strategy_type: "fx"
     magic: 777002
     timeframe: "M15"

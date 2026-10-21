@@ -29,7 +29,7 @@ from core.central_risk_desk import CentralRiskDesk
 
 
 def test_1_spread_spike_barrier():
-    desk = CentralRiskDesk()
+    desk = CentralRiskDesk(rollover_curfew_utc=("00:00", "00:00"))
     acc = {"equity": 10000.0, "margin_level": 500.0, "margin": 100.0}
     desk.update_account_state(acc)
 
@@ -59,7 +59,7 @@ def test_2_rollover_curfew_barrier():
 
 
 def test_3_post_sl_cooldown():
-    desk = CentralRiskDesk(post_sl_cooldown_seconds=2.0)
+    desk = CentralRiskDesk(post_sl_cooldown_seconds=2.0, rollover_curfew_utc=("00:00", "00:00"))
     acc = {"equity": 10000.0, "margin_level": 500.0, "margin": 100.0}
     desk.update_account_state(acc)
 
@@ -159,7 +159,7 @@ def test_6_daily_drawdown_auto_halt_generation():
 
 
 def test_7_asset_cluster_correlation_barrier():
-    desk = CentralRiskDesk(max_positions_per_cluster=2)
+    desk = CentralRiskDesk(max_positions_per_cluster=2, rollover_curfew_utc=("00:00", "00:00"))
     acc = {"equity": 10000.0, "margin_level": 500.0, "margin": 100.0}
     desk.update_account_state(acc)
 
@@ -247,6 +247,45 @@ def test_9_asymmetric_hysteresis_recovery_ladder():
     print("✅ Test 9: Asymmetric Risk Recovery Hysteresis Ladder PASSED")
 
 
+def test_10_daily_drawdown_auto_reset_on_new_day():
+    test_halt_file = _ROOT / "HALT_TEST_AUTORESET"
+    if test_halt_file.exists():
+        test_halt_file.unlink()
+
+    # Case A: Daily Drawdown from previous day -> Should AUTO RESET
+    payload_dd = (
+        "EMERGENCY_HALT_TRIGGERED_AT: 2026-10-18T10:00:00\n"
+        "EQUITY: $9,900.00\n"
+        "REASON: Daily Drawdown Hard Limit breached: -$300.00 (-3.00%) vs Limit: $300.00 / 5.0%\n"
+    )
+    test_halt_file.write_text(payload_dd, encoding="utf-8")
+    # Set modification time to 2 days ago
+    two_days_ago = time.time() - (2 * 86400)
+    os.utime(test_halt_file, (two_days_ago, two_days_ago))
+
+    desk = CentralRiskDesk(halt_file=str(test_halt_file))
+    res = desk.check_and_reset_daily_halt()
+    assert res is True, "Expected auto-reset for prior day Daily Drawdown"
+    assert not test_halt_file.exists(), "Halt file should be unlinked"
+    assert not desk._is_halted
+
+    # Case B: Margin Depletion from previous day -> Must NOT auto reset
+    payload_margin = (
+        "EMERGENCY_HALT_TRIGGERED_AT: 2026-10-18T10:00:00\n"
+        "EQUITY: $5,000.00\n"
+        "REASON: Emergency Margin Depletion: Margin level 120.0% < 150.0% critical barrier.\n"
+    )
+    test_halt_file.write_text(payload_margin, encoding="utf-8")
+    os.utime(test_halt_file, (two_days_ago, two_days_ago))
+
+    desk_margin = CentralRiskDesk(halt_file=str(test_halt_file))
+    res_m = desk_margin.check_and_reset_daily_halt()
+    assert res_m is False, "Catastrophic margin halt must NOT be auto-cleared"
+    assert test_halt_file.exists(), "Critical halt file must remain locked"
+    test_halt_file.unlink()
+    print("✅ Test 10: Auto-Reset on New Day (Daily DD vs Margin) PASSED")
+
+
 def run_all_comprehensive_tests():
     print("=====================================================================")
     print(" RUNNING CENTRAL RISK DESK COMPREHENSIVE INSTITUTIONAL SUITE")
@@ -260,8 +299,9 @@ def run_all_comprehensive_tests():
     test_7_asset_cluster_correlation_barrier()
     test_8_all_time_trailing_hwm_drawdown()
     test_9_asymmetric_hysteresis_recovery_ladder()
+    test_10_daily_drawdown_auto_reset_on_new_day()
     print("=====================================================================")
-    print("🎉 ALL 9 INSTITUTIONAL RISK DIMENSION TESTS PASSED PERFECTLY!")
+    print("🎉 ALL 10 INSTITUTIONAL RISK DIMENSION TESTS PASSED PERFECTLY!")
     print("=====================================================================")
 
 
