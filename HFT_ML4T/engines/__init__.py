@@ -16,6 +16,13 @@ from .ml4t_meta_labeler import (
     calculate_macro_trend_ema200
 )
 from .position_sizer import PositionSizer
+from .hrp_allocator import HierarchicalRiskParityAllocator
+from .ml4t_data_pipeline import (
+    ParquetFeatureCollector,
+    TripleBarrierMetaLabeler,
+    OrthogonalFactorNeutralizer,
+    CombinatorialPurgedCrossValidation
+)
 
 __all__ = [
     "AvellanedaStoikovEngine",
@@ -28,4 +35,9 @@ __all__ = [
     "calculate_macro_regime_slope",
     "calculate_macro_trend_ema200",
     "PositionSizer",
+    "HierarchicalRiskParityAllocator",
+    "ParquetFeatureCollector",
+    "TripleBarrierMetaLabeler",
+    "OrthogonalFactorNeutralizer",
+    "CombinatorialPurgedCrossValidation",
 ]

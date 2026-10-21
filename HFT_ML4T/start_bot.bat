@@ -37,26 +37,37 @@ echo [%date% %time%] Starting HFT bot (attempt %RESTART_COUNT%/%MAX_RESTARTS%)..
 echo.
 
 :: Run the bot
-python run_hft_bot.py
+call python run_hft_bot.py
 
 :: Check exit code
 set EXIT_CODE=%ERRORLEVEL%
 
-if %EXIT_CODE% EQU 0 (
-    echo.
-    echo =======================================================
-    echo  Bot stopped gracefully [exit code 0]. Not restarting.
-    echo =======================================================
-    exit /b 0
-)
+if %EXIT_CODE% EQU 42 goto handle_hot_reload
+if %EXIT_CODE% EQU 0 goto handle_clean_exit
+goto handle_error_exit
 
+:handle_hot_reload
+echo.
+echo =======================================================
+echo  [HOT-RELOAD] Zero-downtime hot-reload triggered
+echo  Restarting immediately with updated code and config
+echo =======================================================
+set /a RESTART_COUNT=0
+ping -n 3 127.0.0.1 >nul
+goto start_loop
+
+:handle_clean_exit
+echo.
+echo =======================================================
+echo  Bot stopped gracefully [exit code 0]. Not restarting.
+echo =======================================================
+exit /b 0
+
+:handle_error_exit
 echo.
 echo =======================================================
 echo  Bot exited with code %EXIT_CODE%.
 echo  Restarting in %RESTART_DELAY% seconds...
 echo =======================================================
-
-:: Wait before restart (using ping for reliable sleep in all environments)
 ping -n %RESTART_DELAY% 127.0.0.1 >nul
-
 goto start_loop

@@ -50,7 +50,9 @@ class CentralRiskDesk:
         max_trailing_drawdown_pct: float = 0.08,     # 8% all-time trailing high-water mark drawdown
         max_positions_per_cluster: int = 2,          # Max 2 concurrent positions per correlated asset cluster
         cluster_map: Optional[Dict[str, list]] = None,
-        auto_write_halt_file: bool = True
+        auto_write_halt_file: bool = True,
+        max_acceptable_slippage_points: float = 25.0, # Slippage barrier cap in points
+        max_acceptable_latency_ms: float = 1200.0     # Execution latency barrier cap in ms
     ):
         self.max_daily_drawdown_usd = max_daily_drawdown_usd
         self.max_daily_drawdown_pct = max_daily_drawdown_pct
@@ -67,6 +69,8 @@ class CentralRiskDesk:
         self.max_positions_per_cluster = max_positions_per_cluster
         self.cluster_map = cluster_map or DEFAULT_ASSET_CLUSTERS
         self.auto_write_halt_file = auto_write_halt_file
+        self.max_acceptable_slippage_points = max_acceptable_slippage_points
+        self.max_acceptable_latency_ms = max_acceptable_latency_ms
 
         self._daily_peak_equity = 0.0
         self._all_time_peak_equity = 0.0
@@ -79,6 +83,7 @@ class CentralRiskDesk:
         self._daily_symbol_pnl: Dict[str, float] = {}
         self._symbol_locked_for_day: Dict[str, bool] = {}
         self._symbol_recovery_trades: Dict[str, int] = {}
+        self._execution_history: Dict[str, list] = {}
 
     def _trigger_emergency_halt(self, reason: str, current_equity: float = 0.0) -> None:
         """Triggers circuit breaker and persists physical HALT_HFT lockfile."""
@@ -358,6 +363,54 @@ class CentralRiskDesk:
                 f"Remaining recovery trades: {self._symbol_recovery_trades[symbol]}"
             )
 
+    def record_execution_metric(self, symbol: str, latency_ms: float, slippage_points: float) -> None:
+        """
+        Monitors execution quality and triggers safety cooldowns if broker
+        slippage or network latency breaches acceptable institutional thresholds.
+        """
+        if symbol not in self._execution_history:
+            self._execution_history[symbol] = []
+
+        self._execution_history[symbol].append({
+            "time": time.time(),
+            "latency_ms": latency_ms,
+            "slippage_points": slippage_points
+        })
+        if len(self._execution_history[symbol]) > 50:
+            self._execution_history[symbol].pop(0)
+
+        # Slippage barrier breach: adverse slippage >= max_acceptable_slippage_points
+        if slippage_points >= self.max_acceptable_slippage_points:
+            cooldown_dur = 90.0
+            reason = f"Severe Adverse Slippage ({slippage_points:+.1f} pts >= {self.max_acceptable_slippage_points:.1f} pts)"
+            logger.warning(f"⚠️ [SLIPPAGE BARRIER BREACHED] {symbol}: {reason}. Pausing quoting for {cooldown_dur:.0f}s.")
+            self.trigger_cooldown(symbol, duration_sec=cooldown_dur, reason=reason)
+
+        # Latency barrier breach: execution latency >= max_acceptable_latency_ms
+        elif latency_ms >= self.max_acceptable_latency_ms:
+            cooldown_dur = 60.0
+            reason = f"Severe Broker Latency ({latency_ms:.0f}ms >= {self.max_acceptable_latency_ms:.0f}ms)"
+            logger.warning(f"⚠️ [LATENCY BARRIER BREACHED] {symbol}: {reason}. Pausing quoting for {cooldown_dur:.0f}s.")
+            self.trigger_cooldown(symbol, duration_sec=cooldown_dur, reason=reason)
+
+    def get_execution_stats(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """Calculates rolling average latency and slippage across symbols."""
+        if symbol:
+            history = self._execution_history.get(symbol, [])
+        else:
+            history = [entry for entries in self._execution_history.values() for entry in entries]
+
+        if not history:
+            return {"sample_count": 0, "avg_latency_ms": 0.0, "avg_slippage_points": 0.0}
+
+        avg_lat = sum(e["latency_ms"] for e in history) / len(history)
+        avg_slip = sum(e["slippage_points"] for e in history) / len(history)
+        return {
+            "sample_count": len(history),
+            "avg_latency_ms": round(avg_lat, 2),
+            "avg_slippage_points": round(avg_slip, 2)
+        }
+
     def get_risk_multiplier(self, current_equity: float) -> float:
         """
         Nautilus Trader Drawdown Ladder De-Risking with Asymmetric Hysteresis Recovery:
@@ -412,8 +465,21 @@ class CentralRiskDesk:
         """Puts a symbol into a temporary cooldown after a loss / stop-loss to eliminate whipsaws."""
         dur = duration_sec if duration_sec is not None else self.post_sl_cooldown_seconds
         if dur > 0:
+            if not hasattr(self, "_cooldown_reasons"):
+                self._cooldown_reasons: Dict[str, str] = {}
             self._symbol_cooldowns[symbol] = time.time() + dur
+            self._cooldown_reasons[symbol] = reason
             logger.info(f"⏳ [RISK COOLDOWN] {symbol} locked for {dur:.0f}s ({reason}) to protect capital.")
+
+    def is_in_cooldown(self, symbol: str) -> bool:
+        """Checks if symbol is currently in an active cooldown window."""
+        return time.time() < self._symbol_cooldowns.get(symbol, 0.0)
+
+    def get_cooldown_reason(self, symbol: str) -> str:
+        """Returns the logged reason for the active cooldown if available."""
+        if not hasattr(self, "_cooldown_reasons"):
+            self._cooldown_reasons: Dict[str, str] = {}
+        return self._cooldown_reasons.get(symbol, "Active Cooldown")
 
     def manual_unlock(self) -> None:
         """Clears halted state if kill-switch file is deleted."""

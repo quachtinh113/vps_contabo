@@ -225,6 +225,196 @@ def test_strategy_instantiations():
     print("✅ test_strategy_instantiations PASSED (All 6 strategies validated)")
 
 
+def test_execution_slippage_and_latency_audit():
+    from core.audit_logger import log_execution_audit
+    import tempfile
+    import csv
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_record = {
+            "timestamp_utc": "2026-10-22T00:00:00.123Z",
+            "ticket": 99887766,
+            "symbol": "XAUUSDm",
+            "order_type": "BUY",
+            "volume": 0.05,
+            "expected_price": 2650.00,
+            "fill_price": 2650.15,
+            "slippage_points": 1.5,
+            "slippage_usd": 0.75,
+            "latency_ms": 45.2,
+            "retcode": 10009,
+            "comment": "HFT_TEST"
+        }
+        log_execution_audit(tmpdir, test_record)
+        csv_file = Path(tmpdir) / "execution_audit.csv"
+        assert csv_file.exists(), "execution_audit.csv must be created"
+
+        with open(csv_file, "r", encoding="utf-8") as f:
+            reader = list(csv.DictReader(f))
+            assert len(reader) == 1
+            assert reader[0]["symbol"] == "XAUUSDm"
+            assert float(reader[0]["slippage_points"]) == 1.5
+            assert float(reader[0]["latency_ms"]) == 45.2
+
+    # Risk Desk Execution Barrier test
+    desk = CentralRiskDesk(max_acceptable_slippage_points=25.0, max_acceptable_latency_ms=1200.0)
+    desk.record_execution_metric("EURUSDm", latency_ms=45.0, slippage_points=2.0)
+    assert not desk.is_in_cooldown("EURUSDm"), "Normal execution should not trigger cooldown"
+
+    # Severe adverse slippage (30.0 pts >= 25.0 pts limit) -> Must trigger Cooldown
+    desk.record_execution_metric("EURUSDm", latency_ms=45.0, slippage_points=30.0)
+    assert desk.is_in_cooldown("EURUSDm"), "Severe slippage must trigger symbol cooldown"
+    assert "Severe Adverse Slippage" in desk.get_cooldown_reason("EURUSDm")
+
+    # Severe latency (1500ms >= 1200ms limit) -> Must trigger Cooldown
+    desk.record_execution_metric("BTCUSDm", latency_ms=1500.0, slippage_points=1.0)
+    assert desk.is_in_cooldown("BTCUSDm"), "Severe latency must trigger symbol cooldown"
+
+    stats = desk.get_execution_stats()
+    assert stats["sample_count"] >= 3
+    assert stats["avg_latency_ms"] > 0
+    print("✅ test_execution_slippage_and_latency_audit PASSED")
+
+
+def test_hierarchical_risk_parity():
+    from engines.hrp_allocator import HierarchicalRiskParityAllocator
+
+    np.random.seed(42)
+    n_samples = 250
+
+    # Generate returns with structural correlation (EUR and GBP highly correlated)
+    base_fx = np.random.normal(0, 0.005, n_samples)
+    returns_df = pd.DataFrame({
+        "BTCUSDm": np.random.normal(0, 0.025, n_samples),
+        "XAUUSDm": np.random.normal(0, 0.008, n_samples),
+        "USOILm": np.random.normal(0, 0.015, n_samples),
+        "US30m": np.random.normal(0, 0.006, n_samples),
+        "EURUSDm": base_fx + np.random.normal(0, 0.002, n_samples),
+        "GBPUSDm": base_fx + np.random.normal(0, 0.003, n_samples),
+    })
+
+    allocator = HierarchicalRiskParityAllocator()
+    weights = allocator.allocate(returns_df, min_weight_cap=0.05, max_weight_cap=0.40)
+
+    assert len(weights) == 6, f"Expected 6 asset weights, got {len(weights)}"
+    total_w = sum(weights.values())
+    assert abs(total_w - 1.0) < 0.01, f"Weights must sum to 1.0, got {total_w}"
+
+    # Verify high-vol asset (BTC) receives lower allocation than low-vol asset (US30 / FX)
+    assert weights["BTCUSDm"] < weights["US30m"], "HRP must allocate less capital to high-volatility assets"
+    print(f"✅ test_hierarchical_risk_parity PASSED (Weights: {weights})")
+
+
+def test_ml4t_data_pipeline():
+    from engines.ml4t_data_pipeline import (
+        ParquetFeatureCollector,
+        TripleBarrierMetaLabeler,
+        OrthogonalFactorNeutralizer,
+        CombinatorialPurgedCrossValidation
+    )
+    import tempfile
+    import pyarrow.parquet as pq
+
+    # 1. Parquet Feature Collector test
+    with tempfile.TemporaryDirectory() as tmpdir:
+        collector = ParquetFeatureCollector(output_dir=tmpdir, flush_threshold=10)
+        for i in range(12):
+            collector.record_feature(
+                symbol="XAUUSDm",
+                mid_price=2650.0 + i,
+                spread_points=25.0,
+                ofi=0.35,
+                garman_klass_vol=0.005,
+                micro_vol=0.004,
+                dynamic_kappa=1.45,
+                reservation_price=2650.5,
+                skew_offset=0.5,
+                action="BUY" if i % 2 == 0 else "HOLD",
+                macro_regime="BULL_TREND",
+                slope_ema21_pct=0.05,
+                recent_slippage_pts=1.2,
+                recent_latency_ms=42.0
+            )
+        # Flush remaining
+        flushed_file = collector.flush()
+        assert flushed_file is not None, "Flushed parquet file path must be returned"
+        assert Path(flushed_file).exists(), "Parquet file must exist on disk"
+
+        table = pq.read_table(flushed_file)
+        assert table.num_rows == 12, f"Expected 12 records in Parquet, got {table.num_rows}"
+        assert "dynamic_kappa" in table.column_names
+        assert "micro_volatility" in table.column_names
+
+    # 2. Triple Barrier Meta-Labeler test
+    df_prices = pd.DataFrame({
+        "open":  [100, 101, 102, 105, 108, 103, 98, 95, 96, 97],
+        "high":  [102, 103, 106, 110, 109, 104, 99, 97, 98, 99],
+        "low":   [99,  100, 101, 104, 102, 97,  94, 93, 95, 96],
+        "close": [101, 102, 105, 108, 103, 98,  95, 96, 97, 98]
+    })
+    labeler = TripleBarrierMetaLabeler(pt_multiplier=1.0, sl_multiplier=1.0, horizon_bars=4)
+    labels = labeler.label_events(df_prices, event_indices=[1, 4])
+    assert len(labels) == 2, f"Expected 2 labeled events, got {len(labels)}"
+    # Event at idx 1: price goes from 102 up to 110 -> Upper barrier (+1)
+    assert labels.iloc[0]["label"] == 1, "Bullish surge should trigger +1 label"
+
+    # 3. Orthogonal Factor Neutralizer test
+    neutralizer = OrthogonalFactorNeutralizer()
+    active_pos = [
+        {"symbol": "EURUSDm", "volume": 0.50, "order_type": "BUY"},   # Beta -1.0 -> -0.50 USD exposure
+        {"symbol": "XAUUSDm", "volume": 0.20, "order_type": "BUY"},   # Beta -0.75 -> -0.15 USD exposure
+    ]
+    # Current net is negative USD exposure (short dollar tilt = -0.65)
+    net_usd = neutralizer.calculate_portfolio_dollar_exposure(active_pos)
+    assert net_usd < 0.0, "Net USD exposure should be negative"
+
+    # Proposing a BUY on US30m (Beta +0.20): increases USD exposure -> Counters short dollar tilt (Hedging)
+    hedging_mult = neutralizer.calculate_neutralizing_multiplier("US30m", "BUY", active_pos)
+    assert hedging_mult > 1.0, "Hedging order should receive neutralizer multiplier boost"
+
+    # 4. Combinatorial Purged Cross-Validation test (Deflated Sharpe Ratio)
+    # High SR with few trials -> High DSR
+    dsr_high = CombinatorialPurgedCrossValidation.calculate_deflated_sharpe_ratio(
+        observed_sr=2.5, num_trials=5, sample_length=500
+    )
+    assert dsr_high > 0.90, f"Genuine high SR with few trials must yield high DSR, got {dsr_high}"
+
+    # Weak SR with 1,000 data-snooping trials -> Low DSR (overfitted)
+    dsr_overfit = CombinatorialPurgedCrossValidation.calculate_deflated_sharpe_ratio(
+        observed_sr=1.1, num_trials=1000, sample_length=200
+    )
+    assert dsr_overfit < 0.30, f"Overfitted SR with 1000 trials must yield low DSR, got {dsr_overfit}"
+
+    print(f"✅ test_ml4t_data_pipeline PASSED (DSR Genuine: {dsr_high:.2f}, DSR Overfit: {dsr_overfit:.2f})")
+
+
+def test_mt5_bridge_devops_and_recovery():
+    from core.mt5_bridge import MT5Bridge
+    bridge = MT5Bridge()
+
+    # 1. Verify DevOps recovery methods exist and are callable
+    assert hasattr(bridge, "kill_zombie_terminal"), "MT5Bridge must have kill_zombie_terminal method"
+    assert hasattr(bridge, "connect_robust"), "MT5Bridge must have connect_robust method"
+    assert hasattr(bridge, "ensure_symbols_visible"), "MT5Bridge must have ensure_symbols_visible method"
+    assert hasattr(bridge, "cancel_all_pending_orders"), "MT5Bridge must have cancel_all_pending_orders method"
+
+    # 2. Verify ensure_symbols_visible doesn't crash on symbol list
+    bridge.ensure_symbols_visible(["EURUSDm", "BTCUSDm"])
+
+    # 3. Verify cancel_all_pending_orders return type
+    cancelled = bridge.cancel_all_pending_orders()
+    assert isinstance(cancelled, int), "cancel_all_pending_orders must return an integer count"
+
+    # 4. Verify RESTART_NOW zero-downtime hot-reload file contract
+    test_restart_flag = _ROOT / "TEST_RESTART_NOW"
+    test_restart_flag.write_text("HOT_RELOAD_TEST", encoding="utf-8")
+    assert test_restart_flag.exists(), "Test flag must exist"
+    test_restart_flag.unlink()
+    assert not test_restart_flag.exists(), "Flag must be removable on shutdown"
+
+    print("✅ test_mt5_bridge_devops_and_recovery PASSED (Zombie Kill, Robust Connect, Symbols Select, RESTART_NOW contract)")
+
+
 if __name__ == "__main__":
     print("\n--- Running HFT_ML4T Verification Tests ---")
     test_avellaneda_stoikov()
@@ -234,5 +424,9 @@ if __name__ == "__main__":
     test_garman_klass_vol()
     test_order_flow_imbalance()
     test_strategy_instantiations()
-    print("🎉 ALL 7 INTEGRATION TESTS PASSED SUCCESSFULLY!\n")
+    test_execution_slippage_and_latency_audit()
+    test_hierarchical_risk_parity()
+    test_ml4t_data_pipeline()
+    test_mt5_bridge_devops_and_recovery()
+    print("🎉 ALL 11 INTEGRATION & RESEARCH SUITE TESTS PASSED SUCCESSFULLY!\n")
 

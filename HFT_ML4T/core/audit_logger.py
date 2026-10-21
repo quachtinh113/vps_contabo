@@ -13,6 +13,7 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+import csv
 import json
 import logging
 from pathlib import Path
@@ -84,3 +85,40 @@ def log_trade_audit(log_dir: str, record: Dict[str, Any]) -> None:
             f.write(json.dumps(record_copy, ensure_ascii=False) + "\n")
     except Exception as e:
         get_logger().error(f"Failed to log trade audit record: {e}")
+
+
+def log_execution_audit(log_dir: str, record: Dict[str, Any]) -> None:
+    """
+    Appends order execution latency and slippage telemetry to execution_audit.csv.
+    Enables statistical analysis and slippage distribution plotting.
+    """
+    try:
+        path = Path(log_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        csv_file = path / "execution_audit.csv"
+
+        fieldnames = [
+            "timestamp_utc",
+            "ticket",
+            "symbol",
+            "order_type",
+            "volume",
+            "expected_price",
+            "fill_price",
+            "slippage_points",
+            "slippage_usd",
+            "latency_ms",
+            "retcode",
+            "comment"
+        ]
+
+        file_exists = csv_file.exists() and csv_file.stat().st_size > 0
+
+        with open(csv_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(record)
+    except Exception as e:
+        get_logger().error(f"Failed to log execution audit record: {e}")
+

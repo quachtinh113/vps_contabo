@@ -37,6 +37,7 @@ from strategies.fx_micro_arbitrage import FXMicroArbitrageStrategy
 from strategies.crypto_micro_scalper import CryptoMicroScalperStrategy
 from strategies.commodity_oil_scalper import OilMicroScalperStrategy
 from strategies.index_micro_scalper import IndexMicroScalperStrategy
+from engines.ml4t_data_pipeline import ParquetFeatureCollector
 
 # Load environment & config
 load_dotenv(_ROOT / ".env")
@@ -101,6 +102,10 @@ def main():
         logger.error("Could not fetch account information.")
         sys.exit(1)
 
+    # Ensure symbols are visible in Market Watch (resilience against broker maintenance/holidays)
+    enabled_symbols = [s.get("name") for s in symbols_cfg if s.get("enabled", False)]
+    mt5_bridge.ensure_symbols_visible(enabled_symbols)
+
     # 2. Real Account Verification Warning
     is_real = acc.get("is_real", False)
     if is_real and live_trading_env:
@@ -151,6 +156,12 @@ def main():
             strategies[sym] = FXMicroArbitrageStrategy(s_cfg)
         logger.info(f"Loaded Strategy [{stype.upper()}] for {sym} (Magic: {s_cfg.get('magic')})")
 
+    # 4.5 Machine Learning Parquet Feature Collector
+    feature_collector = ParquetFeatureCollector(
+        output_dir=str(_ROOT / "data" / "features"),
+        flush_threshold=100
+    )
+
     poll_interval = system_cfg.get("polling_interval_seconds", 2.0)
     enable_breakeven = risk_cfg.get("enable_breakeven_guard", True)
     breakeven_ratio = risk_cfg.get("breakeven_trigger_ratio", 0.50)
@@ -164,6 +175,38 @@ def main():
 
     # Main Trading Loop
     while _running:
+        # Check Zero-Downtime Graceful Hot-Reload Trigger (RESTART_NOW)
+        restart_file = _ROOT / "RESTART_NOW"
+        if restart_file.exists():
+            logger.info("🔄 [HOT-RELOAD] Detected 'RESTART_NOW' signal file. Initiating zero-downtime graceful shutdown...")
+            try:
+                cancelled = mt5_bridge.cancel_all_pending_orders()
+                logger.info(f"🚫 [HOT-RELOAD] Cleaned up {cancelled} pending order(s).")
+            except Exception as e_pend:
+                logger.error(f"[HOT-RELOAD] Error cancelling pending orders: {e_pend}")
+
+            try:
+                feature_collector.flush()
+                logger.info("💾 [HOT-RELOAD] ML feature collector flushed to disk.")
+            except Exception as e_fl:
+                logger.error(f"[HOT-RELOAD] Error flushing features: {e_fl}")
+
+            try:
+                mt5_bridge.shutdown()
+                logger.info("🔒 [HOT-RELOAD] MT5 connection cleanly disconnected.")
+            except Exception as e_shut:
+                logger.error(f"[HOT-RELOAD] Error during MT5 shutdown: {e_shut}")
+
+            try:
+                if restart_file.exists():
+                    restart_file.unlink()
+                    logger.info("🗑️ [HOT-RELOAD] Removed 'RESTART_NOW' signal file.")
+            except Exception as e_unl:
+                logger.error(f"[HOT-RELOAD] Error removing RESTART_NOW file: {e_unl}")
+
+            logger.info("🚀 [HOT-RELOAD] Shutdown complete. Handing over to Watchdog/Supervisor for instant restart.")
+            sys.exit(42)
+
         try:
             loop_start = time.time()
             acc = mt5_bridge.get_account_info()
@@ -377,7 +420,8 @@ def main():
                     )
 
                     if live_trading_env:
-                        # Real money order dispatch
+                        # Real money order dispatch with expected reservation price telemetry
+                        target_exp_price = signal_res.get("reservation_price") or snapshot.get("mid", 0.0)
                         success, msg, ticket = mt5_bridge.send_order(
                             symbol=sym,
                             order_type=action,
@@ -385,11 +429,22 @@ def main():
                             sl_price=sl,
                             tp_price=tp,
                             magic=magic,
-                            comment=comment
+                            comment=comment,
+                            expected_price=target_exp_price
                         )
                         signal_res["execution_status"] = "FILLED" if success else "FAILED"
                         signal_res["order_ticket"] = ticket
                         signal_res["error_message"] = msg
+
+                        exec_metrics = mt5_bridge.get_last_execution_metrics()
+                        if exec_metrics:
+                            signal_res["execution_metrics"] = exec_metrics
+                            risk_desk.record_execution_metric(
+                                symbol=sym,
+                                latency_ms=exec_metrics.get("latency_ms", 0.0),
+                                slippage_points=exec_metrics.get("slippage_points", 0.0)
+                            )
+
                         if success:
                             risk_desk.consume_recovery_trade(sym)
                         else:
@@ -402,6 +457,25 @@ def main():
                     # Audit Record Logging
                     log_trade_audit(str(_ROOT / "logs"), signal_res)
 
+                    # Machine Learning Parquet Feature Telemetry
+                    exec_stats = risk_desk.get_execution_stats(sym)
+                    feature_collector.record_feature(
+                        symbol=sym,
+                        mid_price=snapshot.get("mid", 0.0),
+                        spread_points=snapshot.get("spread_points", 0.0),
+                        ofi=signal_res.get("ofi", 0.0),
+                        garman_klass_vol=signal_res.get("volatility", 0.0),
+                        micro_vol=signal_res.get("micro_volatility", signal_res.get("volatility", 0.0)),
+                        dynamic_kappa=signal_res.get("dynamic_kappa", 1.5),
+                        reservation_price=signal_res.get("reservation_price", snapshot.get("mid", 0.0)),
+                        skew_offset=signal_res.get("skew_offset", 0.0),
+                        action=action,
+                        macro_regime=signal_res.get("macro_regime", "UNKNOWN"),
+                        slope_ema21_pct=signal_res.get("slope_ema21_pct", 0.0),
+                        recent_slippage_pts=exec_stats.get("avg_slippage_points", 0.0),
+                        recent_latency_ms=exec_stats.get("avg_latency_ms", 0.0)
+                    )
+
             elapsed = time.time() - loop_start
             sleep_time = max(0.1, poll_interval - elapsed)
             time.sleep(sleep_time)
@@ -411,6 +485,7 @@ def main():
             time.sleep(3.0)
 
     # Clean shutdown
+    feature_collector.flush()
     mt5_bridge.shutdown()
     logger.info("✅ HFT_ML4T shutdown completed.")
 
