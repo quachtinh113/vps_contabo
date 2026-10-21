@@ -106,6 +106,7 @@ def test_central_risk_desk():
         account_info={"equity": 9700.0, "margin_level": 500.0, "margin": 100.0}  # -$300 DD > $200 limit
     )
     assert not safe_dd, "Should trigger Circuit Breaker on drawdown breach"
+    desk.manual_unlock()
     print("✅ test_central_risk_desk PASSED")
 
 

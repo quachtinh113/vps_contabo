@@ -53,6 +53,11 @@ class IndexMicroScalperStrategy:
         self.cusum_filter = CUSUMEventFilter(threshold_multiplier=1.7)
         self.gatekeeper = MLMetaGatekeeper(veto_threshold=0.80)
         
+        trend_cfg = config.get("trend_filter", {})
+        self.h1_ema_period = trend_cfg.get("h1_ema_period", 50)
+        self.donchian_period = trend_cfg.get("donchian_period", 20)
+        self.block_consecutive_impulse = trend_cfg.get("block_consecutive_impulse", 2)
+
         sizing_cfg = config.get("position_sizing", {})
         self.position_sizer = PositionSizer(
             risk_per_trade_pct=sizing_cfg.get("risk_per_trade_pct", 0.005),
@@ -85,7 +90,6 @@ class IndexMicroScalperStrategy:
             return None
 
         # 0. Session Filter: US30 Index Peak Liquidity Hours (13:00 - 21:00 UTC)
-        # Chỉ áp dụng riêng cho chỉ số chứng khoán (US30m)
         if self.trading_session_utc and len(self.trading_session_utc) == 2:
             start_utc, end_utc = self.trading_session_utc
             ts = market_snapshot.get("time")
@@ -142,37 +146,100 @@ class IndexMicroScalperStrategy:
         if not action:
             return None
 
-        # 5. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
+        # 5. Mandatory H1 Trend Filter (Close_H1 > EMA50_H1 OR Close_H1 > DonchianMid_H1)
+        if h1_df is not None and len(h1_df) >= max(self.h1_ema_period, self.donchian_period):
+            close_h1 = float(h1_df["close"].iloc[-1])
+            ema50_h1 = float(h1_df["close"].ewm(span=self.h1_ema_period, adjust=False).mean().iloc[-1])
+            donchian_high = float(h1_df["high"].iloc[-self.donchian_period:].max())
+            donchian_low = float(h1_df["low"].iloc[-self.donchian_period:].min())
+            donchian_mid = (donchian_high + donchian_low) / 2.0
+
+            if action == "BUY":
+                buy_trend_valid = (close_h1 > ema50_h1) or (close_h1 > donchian_mid)
+                if not buy_trend_valid:
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(BUY rejected: H1 Close {close_h1:.1f} <= EMA50 {ema50_h1:.1f} and <= DonchianMid {donchian_mid:.1f})"
+                    )
+                    return None
+            elif action == "SELL":
+                sell_trend_valid = (close_h1 < ema50_h1) or (close_h1 < donchian_mid)
+                if not sell_trend_valid:
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(SELL rejected: H1 Close {close_h1:.1f} >= EMA50 {ema50_h1:.1f} and >= DonchianMid {donchian_mid:.1f})"
+                    )
+                    return None
+
+        # 5.1 Institutional Multi-Horizon Macro Regime & Velocity Gating
         macro_info = calculate_macro_regime_slope(rates_df, h1_df)
         if macro_info.get("regime") != "UNKNOWN":
             if action == "BUY":
                 if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
-                    logger.debug(
-                        f"[US30_PULSE] VETO BUY: H1 Macro Regime is Bearish or Slope < 0 "
-                        f"(EMA21: {macro_info.get('ema21', 0):.2f}, EMA50: {macro_info.get('ema50', 0):.2f}, Slope: {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(BUY rejected: H1 Bearish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
                     )
                     return None
             elif action == "SELL":
                 if macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03:
-                    logger.debug(
-                        f"[US30_PULSE] VETO SELL: H1 Macro Regime is Bullish or Slope > 0 "
-                        f"(EMA21: {macro_info.get('ema21', 0):.2f}, EMA50: {macro_info.get('ema50', 0):.2f}, Slope: {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(SELL rejected: H1 Bullish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
                     )
                     return None
         elif ema200_h1 is not None:
             if action == "BUY" and mid_price < ema200_h1:
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected below H1 EMA200)")
                 return None
             elif action == "SELL" and mid_price > ema200_h1:
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected above H1 EMA200)")
                 return None
 
-        # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)
+        # 5.2 Block Consecutive Impulse Bars (Never catch falling knives / chasing spikes)
+        if len(rates_df) >= 3:
+            b1 = rates_df.iloc[-2]
+            b2 = rates_df.iloc[-3]
+            curr = rates_df.iloc[-1]
+            
+            if action == "BUY":
+                is_falling_knife = (b2["close"] < b2["open"]) and (b1["close"] < b1["open"]) and (b1["close"] < b2["close"])
+                if is_falling_knife and (curr["close"] < curr["open"] or curr["close"] < b1["close"]):
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(BUY rejected: Falling knife detected - consecutive bearish impulse bars on M15)"
+                    )
+                    return None
+
+            elif action == "SELL":
+                is_rising_spike = (b2["close"] > b2["open"]) and (b1["close"] > b1["open"]) and (b1["close"] > b2["close"])
+                if is_rising_spike and (curr["close"] > curr["open"] or curr["close"] > b1["close"]):
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(SELL rejected: Rising spike detected - consecutive bullish impulse bars on M15)"
+                    )
+                    return None
+
+        # 5.3 M15 Pullback Trigger Confirmation
         ema20_m15 = float(rates_df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
-        if action == "BUY" and mid_price < ema20_m15 * 0.999:
-            logger.debug(f"[US30_PULSE] VETO BUY: Price {mid_price:.2f} below M15 EMA20 {ema20_m15:.2f} (Bearish Impulse)")
-            return None
-        elif action == "SELL" and mid_price > ema20_m15 * 1.001:
-            logger.debug(f"[US30_PULSE] VETO SELL: Price {mid_price:.2f} above M15 EMA20 {ema20_m15:.2f} (Bullish Impulse)")
-            return None
+        if action == "BUY":
+            recent_lows = rates_df["low"].iloc[-4:]
+            had_pullback = any(low_val <= (ema20_m15 * 1.002) for low_val in recent_lows)
+            if not had_pullback or mid_price < (ema20_m15 * 0.999):
+                logger.info(
+                    f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                    f"(BUY rejected: M15 Pullback not confirmed / Price {mid_price:.1f} vs EMA20 {ema20_m15:.1f})"
+                )
+                return None
+        elif action == "SELL":
+            recent_highs = rates_df["high"].iloc[-4:]
+            had_pullback = any(high_val >= (ema20_m15 * 0.998) for high_val in recent_highs)
+            if not had_pullback or mid_price > (ema20_m15 * 1.001):
+                logger.info(
+                    f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                    f"(SELL rejected: M15 Pullback not confirmed / Price {mid_price:.1f} vs EMA20 {ema20_m15:.1f})"
+                )
+                return None
 
         # 6. ML Meta Gatekeeper Check
         sma20 = rates_df["close"].rolling(20).mean().iloc[-1]

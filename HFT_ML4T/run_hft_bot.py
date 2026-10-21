@@ -21,6 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from datetime import datetime, timezone
 import yaml
+import pandas as pd
 from dotenv import load_dotenv
 
 # Path setup
@@ -124,7 +125,10 @@ def main():
         halt_file=str(_ROOT / "HALT_HFT"),
         post_sl_cooldown_seconds=risk_cfg.get("post_sl_cooldown_seconds", 300.0),
         max_daily_loss_per_symbol_usd=risk_cfg.get("max_daily_loss_per_symbol_usd", 80.0),
-        consecutive_loss_cooldowns=tuple(risk_cfg.get("consecutive_loss_cooldowns", [300, 2700, -1]))
+        consecutive_loss_cooldowns=tuple(risk_cfg.get("consecutive_loss_cooldowns", [300, 2700, -1])),
+        max_trailing_drawdown_pct=risk_cfg.get("max_trailing_drawdown_pct", 0.08),
+        max_positions_per_cluster=risk_cfg.get("max_positions_per_cluster", 2),
+        auto_write_halt_file=risk_cfg.get("auto_write_halt_file", True)
     )
     risk_desk.update_account_state(acc)
 
@@ -150,6 +154,9 @@ def main():
     poll_interval = system_cfg.get("polling_interval_seconds", 2.0)
     enable_breakeven = risk_cfg.get("enable_breakeven_guard", True)
     breakeven_ratio = risk_cfg.get("breakeven_trigger_ratio", 0.50)
+    enable_profit_ladder = risk_cfg.get("enable_profit_ladder", True)
+    global_ladder_cfg = risk_cfg.get("profit_ladder", {})
+    last_close_attempts = {}  # ticket -> last_attempt_ts
     tracked_positions = {}  # ticket -> (symbol, open_price, type, magic)
     last_status_print = 0.0
 
@@ -189,10 +196,35 @@ def main():
                 except Exception as e:
                     logger.debug(f"Error checking closed deal #{t}: {e}")
 
-            # B. Apply Breakeven Guard on active open positions
+            # B. Apply Breakeven Guard & Dynamic ATR Trailing Stop on active open positions
             for p in open_pos_all:
                 if p.ticket not in tracked_positions:
-                    tracked_positions[p.ticket] = (p.symbol, p.price_open, p.type, p.magic)
+                    tracked_positions[p.ticket] = {
+                        "symbol": p.symbol,
+                        "open_price": p.price_open,
+                        "type": p.type,
+                        "magic": p.magic,
+                        "highest_high": p.price_current,
+                        "lowest_low": p.price_current
+                    }
+
+                pos_meta = tracked_positions[p.ticket]
+                if isinstance(pos_meta, tuple):  # compatibility
+                    pos_meta = {
+                        "symbol": pos_meta[0],
+                        "open_price": pos_meta[1],
+                        "type": pos_meta[2],
+                        "magic": pos_meta[3],
+                        "highest_high": p.price_current,
+                        "lowest_low": p.price_current
+                    }
+                    tracked_positions[p.ticket] = pos_meta
+
+                # Update extreme running price
+                if p.type == 0:  # BUY
+                    pos_meta["highest_high"] = max(pos_meta.get("highest_high", p.price_current), p.price_current)
+                else:  # SELL
+                    pos_meta["lowest_low"] = min(pos_meta.get("lowest_low", p.price_current), p.price_current)
 
                 if enable_breakeven and p.magic in [s.magic for s in strategies.values()]:
                     s_info = mt5_bridge.get_symbol_info(p.symbol)
@@ -216,35 +248,47 @@ def main():
                     # Nautilus Time-Barrier Exit (Alpha Decay after 4 hours / 16 bars M15)
                     pos_age_sec = time.time() - p.time
                     if pos_age_sec >= (16 * 15 * 60):
-                        logger.info(f"⏳ [TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/3600:.1f}h (Alpha Decay Horizon)")
-                        mt5_bridge.close_position(p, comment="TIME_BARRIER")
+                        now_ts = time.time()
+                        if now_ts - last_close_attempts.get(p.ticket, 0) >= 300:  # retry every 5m if market closed
+                            last_close_attempts[p.ticket] = now_ts
+                            logger.info(f"⏳ [TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/3600:.1f}h (Alpha Decay Horizon)")
+                            closed_ok, close_msg = mt5_bridge.close_position(p, comment="TIME_BARRIER")
+                            if not closed_ok and ("10018" in str(close_msg) or "closed" in str(close_msg).lower()):
+                                logger.info(f"⏸️ [MARKET_CLOSED] Ticket #{p.ticket} {p.symbol} will auto-close when market opens.")
                         continue
 
-                    # Nautilus Two-Tier Profit Locking Ladder
-                    if p.type == 0:  # BUY
-                        if tp_dist > 0:
-                            # Tier 2: Lock 50% TP when gain reaches 75% TP
-                            if profit_dist >= tp_dist * 0.75:
-                                target_sl = p.price_open + (tp_dist * 0.50)
+                    # Tier 1: Dynamic ATR Trailing Stop with Guaranteed Breakeven Floor
+                    trailing_cfg = risk_cfg.get("trailing_stop", {})
+                    if trailing_cfg.get("enabled", True) and tp_dist > 0:
+                        # Quick ATR calculation from recent bars
+                        rates_recent = mt5_bridge.get_rates_df(p.symbol, timeframe="M15", count=20)
+                        if rates_recent is not None and len(rates_recent) >= 14:
+                            hl = rates_recent["high"] - rates_recent["low"]
+                            hc = (rates_recent["high"] - rates_recent["close"].shift(1)).abs()
+                            lc = (rates_recent["low"] - rates_recent["close"].shift(1)).abs()
+                            current_atr = float(pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean().iloc[-1])
+                        else:
+                            current_atr = buffer_pts * 2.0
+
+                        atr_mult = trailing_cfg.get("atr_multiplier", 1.5)
+                        min_gain_ratio = trailing_cfg.get("min_gain_ratio", 0.60)
+
+                        if p.type == 0:  # BUY
+                            if profit_dist >= max(current_atr * 1.5, tp_dist * min_gain_ratio):
+                                be_sl = p.price_open + buffer_pts
+                                dyn_sl = pos_meta["highest_high"] - (atr_mult * current_atr)
+                                target_sl = max(be_sl, dyn_sl)
                                 if p.sl < target_sl:
-                                    mt5_bridge.modify_position_sl(p, target_sl)
-                            # Tier 1: Lock 25% TP when gain reaches 50% TP
-                            elif profit_dist >= tp_dist * 0.50:
-                                target_sl = p.price_open + (tp_dist * 0.25)
-                                if p.sl < target_sl:
+                                    logger.info(f"🎯 [ATR TRAILING] Ticket #{p.ticket} {p.symbol} BUY: Moving SL from {p.sl:.5f} to {target_sl:.5f}")
                                     mt5_bridge.modify_position_sl(p, target_sl)
 
-                    elif p.type == 1:  # SELL
-                        if tp_dist > 0:
-                            # Tier 2: Lock 50% TP when gain reaches 75% TP
-                            if profit_dist >= tp_dist * 0.75:
-                                target_sl = p.price_open - (tp_dist * 0.50)
+                        elif p.type == 1:  # SELL
+                            if profit_dist >= max(current_atr * 1.5, tp_dist * min_gain_ratio):
+                                be_sl = p.price_open - buffer_pts
+                                dyn_sl = pos_meta["lowest_low"] + (atr_mult * current_atr)
+                                target_sl = min(be_sl, dyn_sl)
                                 if p.sl > target_sl or p.sl == 0:
-                                    mt5_bridge.modify_position_sl(p, target_sl)
-                            # Tier 1: Lock 25% TP when gain reaches 50% TP
-                            elif profit_dist >= tp_dist * 0.50:
-                                target_sl = p.price_open - (tp_dist * 0.25)
-                                if p.sl > target_sl or p.sl == 0:
+                                    logger.info(f"🎯 [ATR TRAILING] Ticket #{p.ticket} {p.symbol} SELL: Moving SL from {p.sl:.5f} to {target_sl:.5f}")
                                     mt5_bridge.modify_position_sl(p, target_sl)
 
             # Periodic heartbeat telemetry print (every 60s)
@@ -300,9 +344,11 @@ def main():
                 min_lot = sym_info.volume_min if sym_info else 0.01
                 lot_step = sym_info.volume_step if sym_info else 0.01
 
-                # Evaluate strategy with Nautilus De-risking Multiplier & H1 Macro Trend Gate
+                # Evaluate strategy with Nautilus De-risking Multiplier & Tier 1 Pod Recovery Sizing
                 risk_mult = risk_desk.get_risk_multiplier(acc["equity"])
-                if risk_mult <= 0:
+                pod_mult = risk_desk.get_symbol_risk_multiplier(sym)
+                effective_risk_mult = risk_mult * pod_mult
+                if effective_risk_mult <= 0:
                     continue
 
                 signal_res = strat.evaluate(
@@ -313,7 +359,7 @@ def main():
                     contract_size=contract_size,
                     min_lot=min_lot,
                     lot_step=lot_step,
-                    risk_multiplier=risk_mult,
+                    risk_multiplier=effective_risk_mult,
                     h1_df=rates_h1
                 )
 
@@ -344,7 +390,9 @@ def main():
                         signal_res["execution_status"] = "FILLED" if success else "FAILED"
                         signal_res["order_ticket"] = ticket
                         signal_res["error_message"] = msg
-                        if not success:
+                        if success:
+                            risk_desk.consume_recovery_trade(sym)
+                        else:
                             logger.warning(f"⚠️ [ORDER REJECTED BY BROKER/MT5] {sym}: {msg}")
                     else:
                         logger.info(f"🛡️ [PAPER TRADE ONLY] Order suppressed because LIVE_TRADING=false")

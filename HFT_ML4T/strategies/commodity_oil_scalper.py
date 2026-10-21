@@ -120,22 +120,29 @@ class OilMicroScalperStrategy:
         if macro_info.get("regime") != "UNKNOWN":
             if action == "BUY":
                 if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
-                    logger.debug(
-                        f"[OIL_BLACKGOLD] VETO BUY: H1 Macro Regime is Bearish or Slope < 0 "
-                        f"(EMA21: {macro_info.get('ema21', 0):.2f}, EMA50: {macro_info.get('ema50', 0):.2f}, Slope: {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(BUY rejected: H1 Bearish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
                     )
                     return None
             elif action == "SELL":
                 if macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03:
-                    logger.debug(
-                        f"[OIL_BLACKGOLD] VETO SELL: H1 Macro Regime is Bullish or Slope > 0 "
-                        f"(EMA21: {macro_info.get('ema21', 0):.2f}, EMA50: {macro_info.get('ema50', 0):.2f}, Slope: {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(SELL rejected: H1 Bullish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
                     )
                     return None
-        elif ema200_h1 is not None:
-            if action == "BUY" and mid_price < ema200_h1:
+
+        # Tier 2: Multi-Timeframe Trend Consensus (H1 & H4 Alignment)
+        if h1_df is not None and len(h1_df) >= 50:
+            h1_close = float(h1_df["close"].iloc[-1])
+            h1_ema50 = float(h1_df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            h1_ema200 = float(h1_df["close"].ewm(span=200, adjust=False).mean().iloc[-1]) if len(h1_df) >= 100 else h1_ema50
+            if action == "BUY" and not (h1_close > h1_ema50 and h1_ema50 >= h1_ema200 * 0.998):
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (BUY rejected: H1 Close/EMA50 below EMA200)")
                 return None
-            elif action == "SELL" and mid_price > ema200_h1:
+            elif action == "SELL" and not (h1_close < h1_ema50 and h1_ema50 <= h1_ema200 * 1.002):
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (SELL rejected: H1 Close/EMA50 above EMA200)")
                 return None
 
         # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)

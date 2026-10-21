@@ -48,6 +48,15 @@ class CryptoMicroScalperStrategy:
             kappa=as_cfg.get("kappa", 1.5),
             ofi_sensitivity=as_cfg.get("ofi_sensitivity", 0.25)
         )
+        self.ofi_threshold = as_cfg.get("ofi_threshold", 0.35)
+        self.ofi_night_threshold = as_cfg.get("ofi_night_threshold", 0.40)
+        
+        vol_cfg = config.get("volume_filter", {})
+        self.volume_filter_enabled = vol_cfg.get("enabled", True)
+        self.volume_sma_period = vol_cfg.get("sma_period", 20)
+        self.volume_min_multiplier = vol_cfg.get("min_multiplier", 1.2)
+        self.night_window_utc = config.get("night_window_utc", ["20:00", "02:00"])
+
         self.cusum_filter = CUSUMEventFilter(threshold_multiplier=1.8)
         self.gatekeeper = MLMetaGatekeeper(veto_threshold=0.80)
         
@@ -82,11 +91,41 @@ class CryptoMicroScalperStrategy:
         if mid_price <= 0 or spread_pts > self.max_spread_points:
             return None
 
+        # 0. Volume Filter: Volume >= 1.2 * SMA(Volume, 20)
+        if self.volume_filter_enabled and "tick_volume" in rates_df.columns and len(rates_df) >= (self.volume_sma_period + 1):
+            curr_vol = float(rates_df["tick_volume"].iloc[-1])
+            vol_sma20 = float(rates_df["tick_volume"].iloc[-(self.volume_sma_period + 1):-1].mean())
+            if vol_sma20 > 0 and curr_vol < (self.volume_min_multiplier * vol_sma20):
+                logger.info(
+                    f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: LOW_VOLUME "
+                    f"(Vol: {curr_vol:.0f} < {self.volume_min_multiplier:.1f}x SMA20: {self.volume_min_multiplier * vol_sma20:.0f})"
+                )
+                return None
+
         # 1. Garman-Klass Volatility
         volatility = calculate_garman_klass_volatility(rates_df, window=20)
 
         # 2. Institutional Order Flow Imbalance (OFI) proxy (ML4T Ch. 21)
         ofi = calculate_order_flow_imbalance(rates_df, window=5)
+
+        # 2.5 Time-of-Day Filter (Thin Night Liquidity 20:00 - 02:00 UTC)
+        current_utc = datetime.now(timezone.utc)
+        ts = market_snapshot.get("time")
+        if ts:
+            if isinstance(ts, (int, float)):
+                current_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+            elif isinstance(ts, datetime):
+                current_utc = ts
+        elif "time" in rates_df.columns:
+            last_t = rates_df["time"].iloc[-1]
+            if isinstance(last_t, pd.Timestamp):
+                current_utc = last_t.to_pydatetime()
+            elif isinstance(last_t, (int, float)):
+                current_utc = datetime.fromtimestamp(last_t, tz=timezone.utc)
+
+        curr_hour = current_utc.hour
+        is_night_window = (curr_hour >= 20 or curr_hour < 2)
+        req_ofi = self.ofi_night_threshold if is_night_window else self.ofi_threshold
 
         # 3. Avellaneda-Stoikov Reservation Pricing
         quotes = self.as_engine.calculate_quotes(
@@ -103,15 +142,23 @@ class CryptoMicroScalperStrategy:
         ret = float(np.log(rates_df["close"].iloc[-1] / rates_df["close"].iloc[-2]))
         is_event, direction = self.cusum_filter.update(ret, volatility)
 
-        # Signal Generation Logic
+        # Signal Generation Logic with Dynamic OFI Threshold
         action = None
         vol_threshold = volatility * mid_price * 0.15
-        if skew_offset > vol_threshold and ofi > 0.20:
+        if skew_offset > vol_threshold and ofi >= req_ofi:
             action = "BUY"
-        elif skew_offset < -vol_threshold and ofi < -0.20:
+        elif skew_offset < -vol_threshold and ofi <= -req_ofi:
             action = "SELL"
-        elif is_event and (direction * ofi > 0) and abs(ofi) >= 0.15:
+        elif is_event and (direction * ofi > 0) and abs(ofi) >= req_ofi:
             action = "BUY" if direction > 0 else "SELL"
+        else:
+            if (skew_offset > vol_threshold and ofi > 0) or (skew_offset < -vol_threshold and ofi < 0) or is_event:
+                if abs(ofi) < req_ofi:
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: OFI_BELOW_THRESHOLD "
+                        f"(OFI: {ofi:+.3f} < {req_ofi:.2f}{' [NIGHT_WINDOW]' if is_night_window else ''})"
+                    )
+            return None
 
         if not action:
             return None
@@ -121,31 +168,45 @@ class CryptoMicroScalperStrategy:
         if macro_info.get("regime") != "UNKNOWN":
             if action == "BUY":
                 if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
-                    logger.debug(
-                        f"[BTC_ORACLE] VETO BUY: H1 Macro Regime is Bearish or Slope < 0 "
-                        f"(EMA21: {macro_info.get('ema21', 0):.2f}, EMA50: {macro_info.get('ema50', 0):.2f}, Slope: {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(BUY rejected: H1 Bearish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
                     )
                     return None
             elif action == "SELL":
                 if macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03:
-                    logger.debug(
-                        f"[BTC_ORACLE] VETO SELL: H1 Macro Regime is Bullish or Slope > 0 "
-                        f"(EMA21: {macro_info.get('ema21', 0):.2f}, EMA50: {macro_info.get('ema50', 0):.2f}, Slope: {macro_info.get('slope_ema21_pct', 0):.3f}%)"
+                    logger.info(
+                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
+                        f"(SELL rejected: H1 Bullish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
                     )
                     return None
         elif ema200_h1 is not None:
             if action == "BUY" and mid_price < ema200_h1:
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected below H1 EMA200)")
                 return None
             elif action == "SELL" and mid_price > ema200_h1:
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected above H1 EMA200)")
+                return None
+
+        # Tier 2: Multi-Timeframe Trend Consensus (H1 & H4 Alignment)
+        if h1_df is not None and len(h1_df) >= 50:
+            h1_close = float(h1_df["close"].iloc[-1])
+            h1_ema50 = float(h1_df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            h1_ema200 = float(h1_df["close"].ewm(span=200, adjust=False).mean().iloc[-1]) if len(h1_df) >= 100 else h1_ema50
+            if action == "BUY" and not (h1_close > h1_ema50 and h1_ema50 >= h1_ema200 * 0.995):
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (BUY rejected: H1 Close/EMA50 below EMA200)")
+                return None
+            elif action == "SELL" and not (h1_close < h1_ema50 and h1_ema50 <= h1_ema200 * 1.005):
+                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (SELL rejected: H1 Close/EMA50 above EMA200)")
                 return None
 
         # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)
         ema20_m15 = float(rates_df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
         if action == "BUY" and mid_price < ema20_m15 * 0.999:
-            logger.debug(f"[BTC_ORACLE] VETO BUY: Price {mid_price:.2f} below M15 EMA20 {ema20_m15:.2f} (Bearish Impulse)")
+            logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected: Price below M15 EMA20)")
             return None
         elif action == "SELL" and mid_price > ema20_m15 * 1.001:
-            logger.debug(f"[BTC_ORACLE] VETO SELL: Price {mid_price:.2f} above M15 EMA20 {ema20_m15:.2f} (Bullish Impulse)")
+            logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected: Price above M15 EMA20)")
             return None
 
         # 6. ML Meta Gatekeeper Check

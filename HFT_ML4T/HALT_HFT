@@ -1,0 +1,4 @@
+EMERGENCY_HALT_TRIGGERED_AT: 2026-10-20T13:29:40.780733+00:00
+EQUITY: $9,960.29
+REASON: Daily Drawdown Hard Limit breached: -$300.06 (-2.92%) vs Limit: $300.00 / 5.0%
+ACTION_REQUIRED: Inspect risk telemetry and delete this file to unlock.
