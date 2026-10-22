@@ -223,7 +223,15 @@ def main():
             # A. Detect closed tickets to trigger Cooldown on SL/loss (Whipsaw protection)
             closed_tickets = [t for t in list(tracked_positions.keys()) if t not in current_tickets]
             for t in closed_tickets:
-                sym_closed, open_px, p_type, magic_closed = tracked_positions.pop(t)
+                pos_data = tracked_positions.pop(t)
+                if isinstance(pos_data, dict):
+                    sym_closed = pos_data.get("symbol", "")
+                    open_px = pos_data.get("open_price", 0.0)
+                    p_type = pos_data.get("type", 0)
+                    magic_closed = pos_data.get("magic", 0)
+                else:
+                    sym_closed, open_px, p_type, magic_closed = pos_data[:4]
+
                 try:
                     import MetaTrader5 as mt5_raw
                     deal_history = mt5_raw.history_deals_get(position=t)
