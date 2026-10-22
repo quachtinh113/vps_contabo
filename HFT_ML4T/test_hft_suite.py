@@ -415,6 +415,65 @@ def test_mt5_bridge_devops_and_recovery():
     print("✅ test_mt5_bridge_devops_and_recovery PASSED (Zombie Kill, Robust Connect, Symbols Select, RESTART_NOW contract)")
 
 
+def test_institutional_tick_backtester():
+    from engines.institutional_tick_backtester import (
+        TickDataPipeline,
+        MicrostructureExecutionModel,
+        HybridBacktestEngine,
+        CombinatorialPurgedCrossValidator
+    )
+
+    # 1. Pipeline test (Pillar 1)
+    pipeline = TickDataPipeline()
+    ticks_df = pipeline.fetch_or_load_ticks(symbol="TEST_ASSET", count=1000, use_cache=False)
+    assert len(ticks_df) == 1000, "Pipeline must generate 1,000 Level 1 ticks"
+    assert "mid" in ticks_df.columns and "ofi" in ticks_df.columns and "micro_vol" in ticks_df.columns
+
+    # 2. Microstructure Execution Model (Pillar 2)
+    exec_model = MicrostructureExecutionModel()
+    lat_ticks = exec_model.get_latency_delay_ticks(tick_interval_ms=50.0)
+    adv_slip = exec_model.get_adverse_slippage_pts()
+    assert lat_ticks >= 1, "Latency delay must be at least 1 tick"
+    assert adv_slip >= 0.0, "Adverse slippage must be non-negative"
+
+    # 3. Hybrid Engine (Pillar 3)
+    hybrid = HybridBacktestEngine(data_pipeline=pipeline, execution_model=exec_model)
+    grid_res = hybrid.run_vectorized_grid_search(
+        symbol="TEST_ASSET",
+        ticks_df=ticks_df,
+        gamma_grid=[0.05, 0.1],
+        kappa_grid=[1.0],
+        ofi_grid=[0.25],
+        max_inv_grid=[2.0]
+    )
+    assert len(grid_res) == 2, f"Expected 2 grid results, got {len(grid_res)}"
+    validated = hybrid.validate_top_candidates_event_driven(
+        symbol="TEST_ASSET",
+        ticks_df=ticks_df,
+        top_candidates=grid_res,
+        top_k=2,
+        max_allowed_divergence_pct=0.05
+    )
+    assert len(validated) == 2, "Event-driven must validate 2 candidates"
+    assert "data_leakage_detected" in validated[0], "Must contain data leakage flag"
+
+    # 4. CPCV & Deflated Sharpe Ratio (Pillar 4)
+    cpcv = CombinatorialPurgedCrossValidator(num_groups=4, test_groups=2, embargo_pct=0.01)
+    cpcv_res = cpcv.evaluate_cpcv(
+        symbol="TEST_ASSET",
+        ticks_df=ticks_df,
+        gamma=0.05,
+        kappa=1.0,
+        ofi_sensitivity=0.25,
+        max_inventory=2.0,
+        num_total_trials=10
+    )
+    assert cpcv_res["cpcv_paths_count"] == 6, f"C(4,2) must equal 6 paths, got {cpcv_res['cpcv_paths_count']}"
+    assert 0.0 <= cpcv_res["deflated_sharpe_ratio"] <= 1.0, "DSR must be bounded in [0, 1]"
+
+    print("✅ test_institutional_tick_backtester PASSED (All 4 Pillars Verified)")
+
+
 if __name__ == "__main__":
     print("\n--- Running HFT_ML4T Verification Tests ---")
     test_avellaneda_stoikov()
@@ -428,5 +487,6 @@ if __name__ == "__main__":
     test_hierarchical_risk_parity()
     test_ml4t_data_pipeline()
     test_mt5_bridge_devops_and_recovery()
-    print("🎉 ALL 11 INTEGRATION & RESEARCH SUITE TESTS PASSED SUCCESSFULLY!\n")
+    test_institutional_tick_backtester()
+    print("🎉 ALL 12 INTEGRATION & RESEARCH SUITE TESTS PASSED SUCCESSFULLY!\n")
 

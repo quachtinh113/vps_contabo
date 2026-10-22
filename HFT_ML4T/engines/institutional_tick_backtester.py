@@ -632,7 +632,7 @@ class HybridBacktestEngine:
                             asks=asks,
                             mids=mids,
                             spreads=spreads,
-                            ofis=ofis,
+                            ofis=ofi_arr,
                             micro_vols=micro_vols,
                             gamma=g,
                             kappa=k,
