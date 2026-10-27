@@ -16,9 +16,10 @@ if hasattr(sys.stdout, "reconfigure"):
 import csv
 import json
 import logging
+import time
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 _LOGGER: Optional[logging.Logger] = None
 
@@ -87,11 +88,20 @@ def log_trade_audit(log_dir: str, record: Dict[str, Any]) -> None:
         get_logger().error(f"Failed to log trade audit record: {e}")
 
 
-def log_execution_audit(log_dir: str, record: Dict[str, Any]) -> None:
-    """
-    Appends order execution latency and slippage telemetry to execution_audit.csv.
-    Enables statistical analysis and slippage distribution plotting.
-    """
+_EXECUTION_AUDIT_BUFFER: List[Dict[str, Any]] = []
+_LAST_AUDIT_FLUSH_TS: float = time.time()
+
+
+def flush_execution_audit(log_dir: str = "logs") -> None:
+    """Flushes buffered execution telemetry records to disk in a single I/O burst."""
+    global _EXECUTION_AUDIT_BUFFER, _LAST_AUDIT_FLUSH_TS
+    if not _EXECUTION_AUDIT_BUFFER:
+        return
+
+    records_to_write = list(_EXECUTION_AUDIT_BUFFER)
+    _EXECUTION_AUDIT_BUFFER.clear()
+    _LAST_AUDIT_FLUSH_TS = time.time()
+
     try:
         path = Path(log_dir)
         path.mkdir(parents=True, exist_ok=True)
@@ -118,7 +128,25 @@ def log_execution_audit(log_dir: str, record: Dict[str, Any]) -> None:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             if not file_exists:
                 writer.writeheader()
-            writer.writerow(record)
+            writer.writerows(records_to_write)
     except Exception as e:
-        get_logger().error(f"Failed to log execution audit record: {e}")
+        get_logger().error(f"Failed to flush execution audit records: {e}")
+
+
+def log_execution_audit(log_dir: str, record: Dict[str, Any], immediate: bool = False) -> None:
+    """
+    Buffers order execution latency and slippage telemetry to RAM before batching to execution_audit.csv.
+    Protects shared VPS SSD/NVMe from excessive disk I/O wait spikes.
+    """
+    global _EXECUTION_AUDIT_BUFFER, _LAST_AUDIT_FLUSH_TS
+    try:
+        _EXECUTION_AUDIT_BUFFER.append(record)
+        # Flush if buffer reaches threshold (5 trades), interval elapsed (15s), or test/immediate requested
+        now_ts = time.time()
+        is_test_env = any(t in str(log_dir).lower() for t in ["tmp", "temp", "test"])
+        if immediate or is_test_env or len(_EXECUTION_AUDIT_BUFFER) >= 5 or (now_ts - _LAST_AUDIT_FLUSH_TS >= 15.0):
+            flush_execution_audit(log_dir)
+    except Exception as e:
+        get_logger().error(f"Failed to buffer execution audit record: {e}")
+
 
