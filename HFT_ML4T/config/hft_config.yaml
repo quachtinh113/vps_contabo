@@ -64,11 +64,11 @@ symbols:
       risk_per_trade_pct: 0.003    # Giảm từ 0.5% xuống 0.3% để hạn chế drawdown
       max_lot_cap: 0.05            # Giảm từ 0.10 xuống 0.05 BTC
     avellaneda_stoikov:
-      gamma: 0.10
-      kappa: 1.5
-      ofi_sensitivity: 0.25
-      ofi_threshold: 0.25          # Nới lỏng từ 0.35 về 0.25 để bắt vi xung lực
-      ofi_night_threshold: 0.30    # Ngưỡng OFI ban đêm giảm từ 0.40 về 0.30
+      gamma: 0.03                  # CPCV Validated (5.3% Divergence)
+      kappa: 0.8
+      ofi_sensitivity: 0.30
+      ofi_threshold: 0.30          # CPCV Validated threshold
+      ofi_night_threshold: 0.35    # Ngưỡng OFI ban đêm
     volume_filter:
       enabled: true
       sma_period: 20               # Volume >= 0.9 * SMA(Volume, 20)
@@ -100,9 +100,9 @@ symbols:
       risk_per_trade_pct: 0.004    # 0.4% risk per trade an toàn
       max_lot_cap: 0.05            # Khống chế 0.05 lot an toàn cho Vàng (0.01 - 0.02 lot phiên Mỹ)
     avellaneda_stoikov:
-      gamma: 0.10
-      kappa: 1.5
-      ofi_sensitivity: 0.25
+      gamma: 0.03                  # CPCV Validated (15.5% Divergence)
+      kappa: 0.8
+      ofi_sensitivity: 0.30
     session_aware_atr:
       enabled: true
       asia_europe_utc: ["07:00", "12:00"] # Đã giới hạn sau 07:00 UTC
@@ -131,9 +131,9 @@ symbols:
       risk_per_trade_pct: 0.007    # Tăng từ 0.5% lên 0.7% vốn để tối đa hóa lợi nhuận
       max_lot_cap: 0.12            # Tăng từ 0.08 lên 0.12 lot (120 thùng)
     avellaneda_stoikov:
-      gamma: 0.12
-      kappa: 1.8
-      ofi_sensitivity: 0.25
+      gamma: 0.03                  # CPCV Validated (28.1% Divergence)
+      kappa: 0.8
+      ofi_sensitivity: 0.30
     multi_tf_consensus:
       enabled: true                # Tier 2: Chỉ mở lệnh M15 khi xu hướng H1 và H4 đồng thuận
       h1_ema_fast: 50
@@ -153,16 +153,16 @@ symbols:
     magic: 777006
     timeframe: "M15"
     max_spread_points: 25.0        # Max allowable spread in points (~2.5$, normal spread is 10 pts)
-    trading_session_utc: ["13:00", "21:00"] # Session Filter: Chỉ áp dụng riêng cho US30m (Phiên Mỹ New York)
+    trading_session_utc: ["13:30", "20:30"] # US Cash Session Gate: Prevents outside-hours closed market attempts
     sl_multiplier: 1.5
     tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87 (Win rate 55.4%)
     position_sizing:
       risk_per_trade_pct: 0.005    # 0.5% vốn
       max_lot_cap: 0.15            # Hạ từ 0.25 xuống 0.15 lot phòng thủ phiên Mỹ
     avellaneda_stoikov:
-      gamma: 0.10
-      kappa: 1.6
-      ofi_sensitivity: 0.25
+      gamma: 0.03                  # CPCV Validated (9.1% Divergence)
+      kappa: 0.8
+      ofi_sensitivity: 0.35
     trend_filter:
       h1_ema_period: 50            # Close_H1 > EMA50_H1 or Close_H1 > DonchianMid_H1
       donchian_period: 20          # Chu kỳ Donchian Channel trên H1
@@ -177,7 +177,7 @@ symbols:
   # PILLAR 5 & 6: Major Forex Pairs (Thanh khoản cao, spread siêu mỏng 6-12 pts)
   # ===================================================================
   - name: "EURUSDm"
-    enabled: true                  # Bật lại để khai thác vi mô phiên London/New York
+    enabled: false                 # Tạm tắt theo khuyến nghị kiểm toán (loại bỏ cặp có kỳ vọng âm)
     strategy_type: "fx"
     magic: 777003
     timeframe: "M15"

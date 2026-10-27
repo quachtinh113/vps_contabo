@@ -29,7 +29,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from core.audit_logger import setup_logger, get_logger, log_trade_audit
+from core.audit_logger import setup_logger, get_logger, log_trade_audit, flush_execution_audit
 from core.central_risk_desk import CentralRiskDesk
 from core.mt5_bridge import MT5Bridge
 from strategies.gold_micro_scalper import GoldMicroScalperStrategy
@@ -186,8 +186,9 @@ def main():
                 logger.error(f"[HOT-RELOAD] Error cancelling pending orders: {e_pend}")
 
             try:
-                feature_collector.flush()
-                logger.info("💾 [HOT-RELOAD] ML feature collector flushed to disk.")
+                feature_collector.close()
+                flush_execution_audit(system_cfg.get("log_dir", "logs"))
+                logger.info("💾 [HOT-RELOAD] ML feature collector & execution audit flushed to disk.")
             except Exception as e_fl:
                 logger.error(f"[HOT-RELOAD] Error flushing features: {e_fl}")
 
@@ -287,7 +288,7 @@ def main():
                     elif "US30" in sym_upper:
                         buffer_pts = max(p_point * 50, 5.0)    # >= 5.0 index pts for Dow Jones
                     elif "XAU" in sym_upper:
-                        buffer_pts = max(p_point * 25, 0.25)   # >= $0.25 buffer for Gold
+                        buffer_pts = max(p_point * 65, 0.65)   # >= $0.65 buffer for Gold (widened from 0.25 to prevent noise stop-outs)
                     elif "OIL" in sym_upper:
                         buffer_pts = max(p_point * 25, 0.05)   # >= $0.05 buffer for Crude Oil
                     else:
@@ -321,7 +322,10 @@ def main():
                         else:
                             current_atr = buffer_pts * 2.0
 
-                        atr_mult = trailing_cfg.get("atr_multiplier", 1.5)
+                        if "XAU" in sym_upper:
+                            atr_mult = 2.2  # Broadened to 2.2x ATR to give Gold trend breathing room
+                        else:
+                            atr_mult = trailing_cfg.get("atr_multiplier", 1.5)
                         min_gain_ratio = trailing_cfg.get("min_gain_ratio", 0.60)
 
                         if p.type == 0:  # BUY
@@ -363,6 +367,13 @@ def main():
                 tick_age = loop_start - snapshot.get("time", 0)
                 if tick_age > 180 and "BTC" not in sym.upper():
                     continue
+
+                # Trading Session Gate for US30m (US Cash Session: 13:30 - 20:30 UTC)
+                if "US30" in sym.upper():
+                    now_utc_dt = datetime.now(timezone.utc)
+                    hm_str = now_utc_dt.strftime("%H:%M")
+                    if not ("13:30" <= hm_str <= "20:30"):
+                        continue
 
                 sym_positions = [p for p in open_pos_all if p.symbol == sym and p.magic == strat.magic]
 

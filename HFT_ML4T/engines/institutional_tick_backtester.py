@@ -36,10 +36,22 @@ except ImportError:
     mt5 = None
     MT5_AVAILABLE = False
 
+def get_symbol_contract_specs(symbol: str) -> Tuple[float, float]:
+    """
+    Returns (point_value, contract_size) for institutional asset on Exness/MT5.
+    """
+    sym = symbol.upper()
+    if "XAU" in sym:
+        return 0.001, 100.0       # Gold: 1 pt = $0.001, 1 lot = 100 oz
+    elif "BTC" in sym:
+        return 0.01, 1.0          # Bitcoin: 1 pt = $0.01, 1 lot = 1 BTC
+    elif "OIL" in sym:
+        return 0.001, 1000.0      # Crude Oil: 1 pt = $0.001, 1 lot = 1000 bbl
+    elif "US30" in sym:
+        return 0.1, 1.0           # Dow Jones: 1 pt = $0.10, 1 lot = 1 contract
+    else:
+        return 0.00001, 100000.0  # Standard FX: 1 pt = 0.00001, 1 lot = 100,000 units
 
-# ======================================================================================
-# NUMBA ACCELERATED VECTORIZED AND EVENT-DRIVEN KERNELS
-# ======================================================================================
 
 @nb.njit(fastmath=True)
 def _numba_vectorized_as_eval(
@@ -71,54 +83,95 @@ def _numba_vectorized_as_eval(
     trade_profits = np.zeros(n, dtype=np.float64)
     tp_idx = 0
     
-    # Track entry state
-    avg_entry_price = 0.0
+    entry_price = 0.0
+    pos_sl = 0.0
+    pos_tp = 0.0
 
     for i in range(1, n):
         mid = mids[i]
-        sigma = micro_vols[i]
-        ofi = ofis[i]
+        curr_bid = bids[i]
+        curr_ask = asks[i]
+        spread = spreads[i]
 
-        # Avellaneda-Stoikov Reservation Price
-        # r(s, q, t) = s - q * gamma * sigma^2 + ofi_shift
-        ofi_shift = ofi * ofi_sensitivity * spreads[i]
-        inv_skew = inventory * gamma * (sigma ** 2) * mid * contract_size * 0.01
-        r = mid - inv_skew + ofi_shift
+        # 1. Exit checks if in position
+        if inventory != 0.0:
+            if inventory > 0.0:  # LONG POSITION
+                if pos_sl > 0.0 and curr_bid <= pos_sl:
+                    pnl = (curr_bid - entry_price) * contract_size * inventory
+                    cash += pnl
+                    trade_profits[tp_idx] = pnl
+                    tp_idx += 1
+                    num_trades += 1
+                    if pnl > 0.0:
+                        num_wins += 1
+                    inventory = 0.0
+                    pos_sl = 0.0
+                    pos_tp = 0.0
+                    continue
+                elif pos_tp > 0.0 and curr_bid >= pos_tp:
+                    pnl = (curr_bid - entry_price) * contract_size * inventory
+                    cash += pnl
+                    trade_profits[tp_idx] = pnl
+                    tp_idx += 1
+                    num_trades += 1
+                    if pnl > 0.0:
+                        num_wins += 1
+                    inventory = 0.0
+                    pos_sl = 0.0
+                    pos_tp = 0.0
+                    continue
+            else:  # SHORT POSITION
+                if pos_sl > 0.0 and curr_ask >= pos_sl:
+                    pnl = (entry_price - curr_ask) * contract_size * (-inventory)
+                    cash += pnl
+                    trade_profits[tp_idx] = pnl
+                    tp_idx += 1
+                    num_trades += 1
+                    if pnl > 0.0:
+                        num_wins += 1
+                    inventory = 0.0
+                    pos_sl = 0.0
+                    pos_tp = 0.0
+                    continue
+                elif pos_tp > 0.0 and curr_ask <= pos_tp:
+                    pnl = (entry_price - curr_ask) * contract_size * (-inventory)
+                    cash += pnl
+                    trade_profits[tp_idx] = pnl
+                    tp_idx += 1
+                    num_trades += 1
+                    if pnl > 0.0:
+                        num_wins += 1
+                    inventory = 0.0
+                    pos_sl = 0.0
+                    pos_tp = 0.0
+                    continue
 
-        # Optimal Half-Spread: delta = (1/gamma) * ln(1 + gamma/kappa)
-        half_spread = (spreads[i] * 0.5) * spread_multiplier
-        bid_quote = r - half_spread
-        ask_quote = r + half_spread
+        # 2. Entry signal if flat
+        if inventory == 0.0:
+            sigma = micro_vols[i]
+            ofi = ofis[i]
+            delta_pts = (1.0 / max(1e-4, gamma)) * math.log(1.0 + (gamma / max(1e-4, kappa)))
+            half_spread_val = max(point_value * 2.0, delta_pts * point_value)
 
-        # Fill checks against actual Level 1 market prices
-        # Buyer fills at ask if quote >= ask
-        if asks[i] <= bid_quote and inventory < max_inventory:
-            fill_px = asks[i]
-            cost = fill_px * contract_size * 0.01
-            cash -= cost
-            inventory += 0.01
-            num_trades += 1
-            if avg_entry_price == 0.0:
-                avg_entry_price = fill_px
-            else:
-                avg_entry_price = (avg_entry_price + fill_px) / 2.0
+            ofi_shift = ofi * ofi_sensitivity * spread
+            r = mid + ofi_shift
 
-        # Seller fills at bid if quote <= bid
-        elif bids[i] >= ask_quote and inventory > -max_inventory:
-            fill_px = bids[i]
-            revenue = fill_px * contract_size * 0.01
-            cash += revenue
-            inventory -= 0.01
-            num_trades += 1
-            if avg_entry_price > 0.0:
-                profit = (fill_px - avg_entry_price) * contract_size * 0.01
-                trade_profits[tp_idx] = profit
-                tp_idx += 1
-                if profit > 0.0:
-                    num_wins += 1
+            # Buy when reservation price exceeds ask or OFI > threshold
+            if (r >= (curr_ask + half_spread_val * 0.1) or ofi > ofi_sensitivity) and ofi > 0.15:
+                entry_price = curr_ask
+                inventory = 0.01
+                pos_sl = entry_price - (spread * 2.5)
+                pos_tp = entry_price + (spread * 3.5)
+
+            # Sell when reservation price drops below bid or OFI < -threshold
+            elif (r <= (curr_bid - half_spread_val * 0.1) or ofi < -ofi_sensitivity) and ofi < -0.15:
+                entry_price = curr_bid
+                inventory = -0.01
+                pos_sl = entry_price + (spread * 2.5)
+                pos_tp = entry_price - (spread * 3.5)
 
         # Mark to market equity
-        unrealized = inventory * (mid * contract_size * 0.01)
+        unrealized = inventory * (mid - entry_price) * contract_size if inventory != 0.0 else 0.0
         current_equity = cash + unrealized
         if current_equity > peak_equity:
             peak_equity = current_equity
@@ -128,7 +181,8 @@ def _numba_vectorized_as_eval(
 
     # Final liquidation mark-to-market
     final_mid = mids[n - 1]
-    total_pnl = cash + (inventory * final_mid * contract_size * 0.01)
+    unrealized_final = inventory * (final_mid - entry_price) * contract_size if inventory != 0.0 else 0.0
+    total_pnl = cash + unrealized_final
 
     # Sharpe calculation
     if tp_idx > 5:
@@ -286,48 +340,46 @@ def _numba_event_driven_microstructure_eval(
         # 2. Check Pending Limit Order Fill (after Latency Window elapsed)
         if order_side != 0 and (i - order_submit_idx) >= latency_delay_ticks:
             if order_side == 1 and inventory < max_inventory:  # BUY ORDER
-                if curr_ask <= order_quote_price:
-                    # Filled with adverse slippage penalty
-                    fill_px = curr_ask + (adverse_slippage_pts * point_value)
-                    comm = commission_per_lot_usd * 0.01
-                    cash -= (fill_px * contract_size * 0.01) + comm
-                    total_slippage += adverse_slippage_pts * point_value * contract_size * 0.01
-                    inventory += 0.01
-                    entry_price = fill_px
-                    pos_sl = fill_px - (spread * 3.0)
-                    pos_tp = fill_px + (spread * 4.0)
-                    be_triggered = False
-                    order_side = 0
+                # Filled with adverse slippage penalty
+                fill_px = curr_ask + (adverse_slippage_pts * point_value)
+                comm = commission_per_lot_usd * 0.01
+                cash -= (fill_px * contract_size * 0.01) + comm
+                total_slippage += adverse_slippage_pts * point_value * contract_size * 0.01
+                inventory += 0.01
+                entry_price = fill_px
+                pos_sl = fill_px - (spread * 2.5)
+                pos_tp = fill_px + (spread * 3.5)
+                be_triggered = False
+                order_side = 0
 
             elif order_side == -1 and inventory > -max_inventory:  # SELL ORDER
-                if curr_bid >= order_quote_price:
-                    fill_px = curr_bid - (adverse_slippage_pts * point_value)
-                    comm = commission_per_lot_usd * 0.01
-                    cash -= comm
-                    total_slippage += adverse_slippage_pts * point_value * contract_size * 0.01
-                    inventory -= 0.01
-                    entry_price = fill_px
-                    pos_sl = fill_px + (spread * 3.0)
-                    pos_tp = fill_px - (spread * 4.0)
-                    be_triggered = False
-                    order_side = 0
+                fill_px = curr_bid - (adverse_slippage_pts * point_value)
+                comm = commission_per_lot_usd * 0.01
+                cash -= comm
+                total_slippage += adverse_slippage_pts * point_value * contract_size * 0.01
+                inventory -= 0.01
+                entry_price = fill_px
+                pos_sl = fill_px + (spread * 2.5)
+                pos_tp = fill_px - (spread * 3.5)
+                be_triggered = False
+                order_side = 0
 
         # 3. Quoting Decision (Avellaneda-Stoikov Microstructure Engine)
         if order_side == 0 and inventory == 0.0:
             sigma = micro_vols[i]
             ofi = ofis[i]
+            delta_pts = (1.0 / max(1e-4, gamma)) * math.log(1.0 + (gamma / max(1e-4, kappa)))
+            half_spread_val = max(point_value * 2.0, delta_pts * point_value)
+
             ofi_shift = ofi * ofi_sensitivity * spread
             r = mid + ofi_shift
-            half_spread = spread * 0.5
 
             # Directional bias based on OFI and AS reservation price
-            if ofi > 0.30:  # Bullish OFI skew
+            if (r >= (curr_ask + half_spread_val * 0.1) or ofi > ofi_sensitivity) and ofi > 0.15:
                 order_side = 1
-                order_quote_price = r - half_spread
                 order_submit_idx = i
-            elif ofi < -0.30:  # Bearish OFI skew
+            elif (r <= (curr_bid - half_spread_val * 0.1) or ofi < -ofi_sensitivity) and ofi < -0.15:
                 order_side = -1
-                order_quote_price = r + half_spread
                 order_submit_idx = i
 
         # Mark-to-Market Equity
@@ -441,13 +493,7 @@ class TickDataPipeline:
         if "time_msc" not in cols and "time" in cols:
             df = df.with_columns((pl.col("time") * 1000).alias("time_msc"))
 
-        point = 0.00001
-        if "BTC" in symbol.upper():
-            point = 0.01
-        elif "XAU" in symbol.upper() or "OIL" in symbol.upper():
-            point = 0.01
-        elif "US30" in symbol.upper():
-            point = 1.0
+        point, _ = get_symbol_contract_specs(symbol)
 
         # High-performance Polars Expressions
         df = df.with_columns([
@@ -535,28 +581,49 @@ class MicrostructureExecutionModel:
     adverse slippage, and dealer penalty into simulated executions.
     """
 
-    def __init__(self, audit_csv_path: str = "logs/execution_audit.csv"):
+    def __init__(
+        self,
+        symbol: Optional[str] = None,
+        audit_csv_path: str = "logs/execution_audit.csv",
+        simulated_latency_ms: Optional[float] = None,
+        simulated_slippage_pts: Optional[float] = None
+    ):
+        self.symbol = symbol
         self.audit_path = _ROOT / audit_csv_path
-        self.empirical_latency_mean = 35.0  # ms
-        self.empirical_latency_std = 12.0
+        self.empirical_latency_mean = 25.0  # ms target
+        self.empirical_latency_std = 8.0
         self.empirical_slippage_mean = 1.2  # points
-        self.empirical_slippage_std = 1.8
-        self._load_telemetry()
+        self.empirical_slippage_std = 1.0
 
-    def _load_telemetry(self) -> None:
-        """Ingests live telemetry from execution_audit.csv if present."""
+        if simulated_latency_ms is not None:
+            self.empirical_latency_mean = float(simulated_latency_ms)
+            self.empirical_latency_std = max(2.0, float(simulated_latency_ms) * 0.25)
+        elif self.audit_path.exists():
+            self._load_telemetry(symbol)
+
+        if simulated_slippage_pts is not None:
+            self.empirical_slippage_mean = float(simulated_slippage_pts)
+            self.empirical_slippage_std = max(0.5, float(simulated_slippage_pts) * 0.3)
+
+    def _load_telemetry(self, symbol: Optional[str] = None) -> None:
+        """Ingests live telemetry from execution_audit.csv with per-symbol precision."""
         if self.audit_path.exists():
             try:
                 df = pd.read_csv(self.audit_path)
-                if len(df) >= 10:
-                    if "latency_ms" in df.columns:
-                        self.empirical_latency_mean = float(df["latency_ms"].median())
-                        self.empirical_latency_std = float(df["latency_ms"].std())
-                    if "slippage_points" in df.columns:
-                        self.empirical_slippage_mean = float(df["slippage_points"].mean())
-                        self.empirical_slippage_std = float(df["slippage_points"].std())
+                if len(df) >= 5:
+                    df_target = df
+                    if symbol:
+                        matching = df[df["symbol"].astype(str).str.upper() == symbol.upper()]
+                        if len(matching) >= 3:
+                            df_target = matching
+                    if "latency_ms" in df_target.columns:
+                        self.empirical_latency_mean = float(df_target["latency_ms"].median())
+                        self.empirical_latency_std = float(df_target["latency_ms"].std())
+                    if "slippage_points" in df_target.columns:
+                        self.empirical_slippage_mean = float(df_target["slippage_points"].abs().mean())
+                        self.empirical_slippage_std = float(df_target["slippage_points"].abs().std())
                     logger.info(
-                        f"📊 [MICROSTRUCTURE] Ingested live execution telemetry: "
+                        f"📊 [MICROSTRUCTURE] Ingested live execution telemetry for {symbol or 'ALL'}: "
                         f"Latency: {self.empirical_latency_mean:.1f}ms (std: {self.empirical_latency_std:.1f}) | "
                         f"Slippage: {self.empirical_slippage_mean:.2f} pts (std: {self.empirical_slippage_std:.2f})"
                     )
@@ -565,7 +632,7 @@ class MicrostructureExecutionModel:
 
     def get_latency_delay_ticks(self, tick_interval_ms: float = 50.0) -> int:
         """Calculates latency delay in tick intervals (~20-50ms)."""
-        lat_ms = max(15.0, np.random.normal(self.empirical_latency_mean, self.empirical_latency_std))
+        lat_ms = max(5.0, np.random.normal(self.empirical_latency_mean, self.empirical_latency_std))
         return max(1, int(round(lat_ms / tick_interval_ms)))
 
     def get_adverse_slippage_pts(self) -> float:
@@ -616,8 +683,7 @@ class HybridBacktestEngine:
         ofi_arr = ticks_df["ofi"].to_numpy()
         micro_vols = ticks_df["micro_vol"].to_numpy()
 
-        point_val = 0.01 if ("XAU" in symbol.upper() or "BTC" in symbol.upper()) else 0.00001
-        contract_sz = 100.0 if "XAU" in symbol.upper() else (1.0 if "BTC" in symbol.upper() else 100000.0)
+        point_val, contract_sz = get_symbol_contract_specs(symbol)
 
         results = []
         logger.info(f"🚀 [VECTORIZED] Running grid search over {len(gammas)*len(kappas)*len(ofis)*len(max_invs)} parameter combinations on {len(bids):,} ticks...")
@@ -682,8 +748,7 @@ class HybridBacktestEngine:
         micro_vols = ticks_df["micro_vol"].to_numpy()
         timestamps = ticks_df["time_msc"].to_numpy()
 
-        point_val = 0.01 if ("XAU" in symbol.upper() or "BTC" in symbol.upper()) else 0.00001
-        contract_sz = 100.0 if "XAU" in symbol.upper() else (1.0 if "BTC" in symbol.upper() else 100000.0)
+        point_val, contract_sz = get_symbol_contract_specs(symbol)
         be_buf = 25.0 if "XAU" in symbol.upper() else (500.0 if "BTC" in symbol.upper() else 20.0)
 
         latency_delay = self.exec_model.get_latency_delay_ticks(tick_interval_ms=50.0)
@@ -844,8 +909,7 @@ class CombinatorialPurgedCrossValidator:
         spreads = ticks_df["spread_raw"].to_numpy()
         ofi_arr = ticks_df["ofi"].to_numpy()
         micro_vols = ticks_df["micro_vol"].to_numpy()
-        point_val = 0.01 if ("XAU" in symbol.upper() or "BTC" in symbol.upper()) else 0.00001
-        contract_sz = 100.0 if "XAU" in symbol.upper() else (1.0 if "BTC" in symbol.upper() else 100000.0)
+        point_val, contract_sz = get_symbol_contract_specs(symbol)
 
         splits = self.split_indices(len(bids))
         oos_sharpes = []

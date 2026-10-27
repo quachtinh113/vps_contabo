@@ -32,11 +32,13 @@ class ParquetFeatureCollector:
         self,
         output_dir: str = "data/features",
         flush_threshold: int = 200,
+        flush_interval_seconds: float = 20.0,
         compression: str = "snappy"
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.flush_threshold = flush_threshold
+        self.flush_interval_seconds = flush_interval_seconds
         self.compression = compression
         self._buffer: List[Dict[str, Any]] = []
         self._last_flush_time = time.time()
@@ -80,7 +82,9 @@ class ParquetFeatureCollector:
         }
         self._buffer.append(record)
 
-        if len(self._buffer) >= self.flush_threshold:
+        # Dual trigger: Flush if count threshold reached OR time window (10-30s) elapsed
+        now_ts = time.time()
+        if len(self._buffer) >= self.flush_threshold or (now_ts - self._last_flush_time >= self.flush_interval_seconds and len(self._buffer) >= 20):
             self.flush()
 
     def flush(self) -> Optional[str]:
@@ -102,7 +106,6 @@ class ParquetFeatureCollector:
 
         table = pa.Table.from_pandas(df, preserve_index=False)
         if file_path.exists():
-            # Append by merging existing table schema
             try:
                 existing_table = pq.read_table(file_path)
                 combined_table = pa.concat_tables([existing_table, table])
@@ -113,6 +116,10 @@ class ParquetFeatureCollector:
             pq.write_table(table, file_path, compression=self.compression)
 
         return str(file_path)
+
+    def close(self) -> None:
+        """Flushes remaining records upon shutdown."""
+        self.flush()
 
     def get_buffer_size(self) -> int:
         return len(self._buffer)
