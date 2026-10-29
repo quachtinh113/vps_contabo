@@ -46,7 +46,7 @@ risk_desk:
     tier1_lock_ratio: 0.25         # Khóa +25% TP distance làm lợi nhuận chắc chắn
     tier2_trigger_ratio: 0.75      # Khi lãi đạt 75% TP distance
     tier2_lock_ratio: 0.50         # Khóa +50% TP distance
-  max_holding_bars_m15: 16         # Nautilus Alpha Decay Time-Barrier (Tối đa 4 tiếng)
+  max_holding_bars_m15: 2          # Nautilus Alpha Decay Time-Barrier (Tối đa 30 phút - 2 nến M15 chống ngâm lệnh)
 
 symbols:
   # ===================================================================

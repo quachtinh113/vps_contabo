@@ -297,13 +297,15 @@ def main():
                     tp_dist = abs(p.tp - p.price_open)
                     profit_dist = (p.price_current - p.price_open) if p.type == 0 else (p.price_open - p.price_current)
                     
-                    # Nautilus Time-Barrier Exit (Alpha Decay after 4 hours / 16 bars M15)
+                    # Nautilus Time-Barrier Exit (Alpha Decay Horizon from Config)
+                    max_holding_bars = risk_cfg.get("max_holding_bars_m15", 2)
+                    max_holding_sec = max_holding_bars * 15 * 60
                     pos_age_sec = time.time() - p.time
-                    if pos_age_sec >= (16 * 15 * 60):
+                    if pos_age_sec >= max_holding_sec:
                         now_ts = time.time()
                         if now_ts - last_close_attempts.get(p.ticket, 0) >= 300:  # retry every 5m if market closed
                             last_close_attempts[p.ticket] = now_ts
-                            logger.info(f"⏳ [TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/3600:.1f}h (Alpha Decay Horizon)")
+                            logger.info(f"⏳ [TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/60:.1f}m (Alpha Decay Horizon: {max_holding_sec/60:.0f}m)")
                             closed_ok, close_msg = mt5_bridge.close_position(p, comment="TIME_BARRIER")
                             if not closed_ok and ("10018" in str(close_msg) or "closed" in str(close_msg).lower()):
                                 logger.info(f"⏸️ [MARKET_CLOSED] Ticket #{p.ticket} {p.symbol} will auto-close when market opens.")
