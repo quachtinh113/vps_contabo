@@ -20,6 +20,8 @@ if str(_ROOT) not in sys.path:
 from strategies.crypto_micro_scalper import CryptoMicroScalperStrategy
 from strategies.index_micro_scalper import IndexMicroScalperStrategy
 from strategies.gold_micro_scalper import GoldMicroScalperStrategy
+from strategies.commodity_oil_scalper import OilMicroScalperStrategy
+from engines.ml4t_meta_labeler import CUSUMEventFilter
 from core.central_risk_desk import CentralRiskDesk
 
 
@@ -60,10 +62,10 @@ def test_btc_filters():
     print("  ✅ 1. BTC Low Volume Filter: Rejected successfully")
 
     # 2. Test Night Window OFI Requirement (+0.05 penalty)
-    # At 22:00 UTC (Night window), required OFI is 0.40. If OFI is 0.36, it should be rejected.
-    assert strat.ofi_threshold == 0.35, f"Base OFI threshold must be 0.35, got {strat.ofi_threshold}"
-    assert strat.ofi_night_threshold == 0.40, f"Night OFI threshold must be 0.40, got {strat.ofi_night_threshold}"
-    print("  ✅ 2. BTC Night OFI Parameter Invariant: Verified (0.35 Day vs 0.40 Night)")
+    # At 22:00 UTC (Night window), required OFI is 0.35.
+    assert strat.ofi_threshold == 0.30, f"Base OFI threshold must be 0.30, got {strat.ofi_threshold}"
+    assert strat.ofi_night_threshold == 0.35, f"Night OFI threshold must be 0.35, got {strat.ofi_night_threshold}"
+    print("  ✅ 2. BTC Night OFI Parameter Invariant: Verified (0.30 Day vs 0.35 Night)")
 
 
 def test_us30_filters():
@@ -147,6 +149,74 @@ def test_config_integrity():
     print("  ✅ Risk Desk Lockout & Exponential Backoff settings intact")
 
 
+def test_pre_market_audit_checklist():
+    print("\n--- Testing Pre-Market Quantitative Audit Checklist (5 Structural Fixes) ---")
+    with open(_ROOT / "config/hft_config.yaml", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    # Check 1 (Unit State): Simulate 10 consecutive ticks within the same M15 bar
+    cusum = CUSUMEventFilter(threshold_mult=1.5)
+    closed_bars = create_synthetic_bars(count=45, base_price=68.50)
+    # Create strong upward move on the last closed bar so CUSUM triggers on bar close
+    closed_bars.loc[closed_bars.index[-2], "close"] = 68.00
+    closed_bars.loc[closed_bars.index[-1], "close"] = 69.50
+
+    bar_ts = int(pd.Timestamp(closed_bars["time"].iloc[-1]).timestamp())
+    signals_emitted = []
+    for tick_idx in range(10):
+        sig_dir = cusum.update_on_closed_bar("USOILm", closed_bars)
+        # Also verify direct update() with same bar_time emits 0 on ticks 2..10
+        dup_check = cusum.update(0.015, 0.002, bar_time=bar_ts, sym="USOILm_direct")
+        signals_emitted.append((sig_dir, dup_check))
+
+    assert cusum.last_bar_time["USOILm"] == bar_ts, "last_bar_time must lock onto closed M15 bar timestamp"
+    # Direct update() must only evaluate on tick 0, and return (False, 0) on ticks 1..9
+    direct_subsequent = [x[1] for x in signals_emitted[1:]]
+    assert all(d == (False, 0) for d in direct_subsequent), f"Duplicate intra-bar CUSUM updates must return (False, 0), got {direct_subsequent}"
+    print(f"  ✅ Check 1 (CUSUM Unit State): 10 intra-bar ticks verified -> last_bar_time={bar_ts} updated 1x, 0 duplicate accumulations")
+
+    # Check 2 (USOILm Sizing): Equity $9,853.24, risk_per_trade_pct = 0.003 ($29.56), SL = 2.2 x ATR14
+    oil_cfg = next(s for s in cfg["symbols"] if s["name"] == "USOILm")
+    gbp_cfg = next(s for s in cfg["symbols"] if s["name"] == "GBPUSDm")
+    assert gbp_cfg["enabled"] is False, "GBPUSDm must be disabled in config"
+    assert oil_cfg["position_sizing"]["risk_per_trade_pct"] == 0.003, f"USOILm risk_per_trade_pct must be 0.003, got {oil_cfg['position_sizing']['risk_per_trade_pct']}"
+    assert oil_cfg["position_sizing"]["max_lot_cap"] == 0.05, f"USOILm max_lot_cap must be 0.05, got {oil_cfg['position_sizing']['max_lot_cap']}"
+    assert oil_cfg["sl_multiplier"] == 2.2, f"USOILm sl_multiplier must be 2.2, got {oil_cfg['sl_multiplier']}"
+    assert oil_cfg["tp_multiplier"] == 3.3, f"USOILm tp_multiplier must be 3.3, got {oil_cfg['tp_multiplier']}"
+    assert oil_cfg["friday_hard_close_utc"] == "20:30"
+
+    oil_strat = OilMicroScalperStrategy(oil_cfg)
+    equity = 9853.24
+    entry_price = 68.50
+    # Construct closed M15 bars with typical USOILm M15 ATR14 ~ $0.30
+    oil_bars = create_synthetic_bars(count=30, base_price=68.50)
+    oil_bars["close"] = 68.50
+    oil_bars["open"] = 68.50
+    oil_bars["high"] = 68.65
+    oil_bars["low"] = 68.35
+    sl_price, tp_price = oil_strat.calculate_triple_barriers(entry_price, side=1, closed_rates_df=oil_bars)
+    sl_dist = abs(entry_price - sl_price)
+    lot, _ = oil_strat.position_sizer.calculate_lot(equity, entry_price, sl_price, contract_size=1000.0)
+    max_loss_usd = lot * sl_dist * 1000.0
+    print(f"  ✅ Check 2 (USOILm Sizing): Equity=${equity:,.2f} | SL Dist=${sl_dist:.3f} (2.2x ATR14) | Lot={lot:.2f} | Max Risk=${max_loss_usd:.2f} (< $30.00)")
+    assert 0.03 <= lot <= 0.05, f"Expected USOILm lot in [0.03, 0.05], got {lot}"
+    assert max_loss_usd <= 30.00, f"Expected max loss <= $30.00, got ${max_loss_usd:.2f}"
+
+    # Check 3 (Reject Log / 10018 Market Closed Guard on US30m)
+    us30_cfg = next(s for s in cfg["symbols"] if s["name"] == "US30m")
+    us30_strat = IndexMicroScalperStrategy(us30_cfg)
+    # Case 3a: Weekend UTC timestamp (Saturday) even if last Friday tick was inside 13:00-21:00
+    sat_utc = datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc)  # Saturday
+    stale_friday_tick = {"mid": 42000.0, "spread_points": 15.0, "time": datetime(2026, 10, 30, 20, 59, tzinfo=timezone.utc), "time_msc": int(datetime(2026, 10, 30, 20, 59, tzinfo=timezone.utc).timestamp() * 1000)}
+    assert us30_strat.is_session_active(sat_utc, stale_friday_tick) is False, "Must block Saturday trading"
+
+    # Case 3b: Weekday inside 13:00-21:00 UTC, but tick is >30s stale (Market closed / holiday)
+    mon_utc = datetime(2026, 11, 2, 15, 0, 0, tzinfo=timezone.utc)
+    stale_tick = {"mid": 42000.0, "spread_points": 15.0, "time": mon_utc, "time_msc": int((mon_utc.timestamp() - 45.0) * 1000)}
+    assert us30_strat.is_session_active(mon_utc, stale_tick) is False, "Must block stale tick (>30s)"
+    print("  ✅ Check 3 (US30m 10018 Market Closed Guard): Weekend & Stale Tick (>30s) blocked before order routing")
+
+
 def main():
     print("=" * 80)
     print("  QUANT TRADING UPGRADE VERIFICATION SUITE")
@@ -155,8 +225,9 @@ def main():
     test_us30_filters()
     test_gold_session_atr()
     test_config_integrity()
+    test_pre_market_audit_checklist()
     print("\n" + "=" * 80)
-    print("  ALL 4 VERIFICATION STAGES PASSED! READY FOR BOT RESTART.")
+    print("  ALL 5 VERIFICATION STAGES PASSED! READY FOR BOT RESTART.")
     print("=" * 80)
 
 

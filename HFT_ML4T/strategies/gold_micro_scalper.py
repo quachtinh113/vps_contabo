@@ -72,19 +72,25 @@ class GoldMicroScalperStrategy:
         lot_step: float = 0.01,
         risk_multiplier: float = 1.0,
         h1_df: Optional[pd.DataFrame] = None,
-        ema200_h1: Optional[float] = None
+        ema200_h1: Optional[float] = None,
+        closed_rates_df: Optional[pd.DataFrame] = None,
+        closed_h1_df: Optional[pd.DataFrame] = None,
+        now_utc: Optional[datetime] = None,
+        is_new_bar: Optional[bool] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluates incoming market data for an optimal HFT order.
         Returns trade instruction dict or None if no trade.
         """
-        if rates_df is None or len(rates_df) < 25:
+        df_m15 = closed_rates_df if closed_rates_df is not None else rates_df
+        df_h1 = closed_h1_df if closed_h1_df is not None else h1_df
+        if df_m15 is None or len(df_m15) < 25:
             return None
 
         # Tier 2: Session Volatility Filter (Stand down in Asian Session: 00:00 - 07:00 UTC)
         session_utc = self.config.get("trading_session_utc", ["07:00", "21:00"])
-        now_utc = datetime.now(timezone.utc)
-        cur_hm = now_utc.strftime("%H:%M")
+        cur_dt = now_utc or datetime.now(timezone.utc)
+        cur_hm = cur_dt.strftime("%H:%M")
         if not (session_utc[0] <= cur_hm <= session_utc[1]):
             return None
 
@@ -93,11 +99,11 @@ class GoldMicroScalperStrategy:
         if mid_price <= 0 or spread_pts > self.max_spread_points:
             return None
 
-        # 1. Garman-Klass Volatility
-        volatility = calculate_garman_klass_volatility(rates_df, window=20)
+        # 1. Garman-Klass Volatility on closed bars
+        volatility = calculate_garman_klass_volatility(df_m15, window=20)
 
         # 2. Institutional Order Flow Imbalance (OFI) proxy (ML4T Ch. 21)
-        ofi = calculate_order_flow_imbalance(rates_df, window=5)
+        ofi = calculate_order_flow_imbalance(df_m15, window=5)
 
         # 3. Avellaneda-Stoikov Reservation Pricing
         quotes = self.as_engine.calculate_quotes(
@@ -110,9 +116,10 @@ class GoldMicroScalperStrategy:
         reservation_price = quotes["reservation_price"]
         skew_offset = quotes["skew_offset"]
 
-        # 4. CUSUM Event Check
-        ret = float(np.log(rates_df["close"].iloc[-1] / rates_df["close"].iloc[-2]))
-        is_event, direction = self.cusum_filter.update(ret, volatility)
+        # 4. CUSUM Event Check (Strictly deduplicated per closed bar timestamp)
+        ret = float(np.log(df_m15["close"].iloc[-1] / df_m15["close"].iloc[-2]))
+        bar_t = df_m15["time"].iloc[-1] if "time" in df_m15.columns else None
+        is_event, direction = self.cusum_filter.update(ret, volatility, bar_time=bar_t, sym=self.symbol)
 
         # Signal Generation Logic:
         action = None
@@ -139,7 +146,7 @@ class GoldMicroScalperStrategy:
             return None
 
         # 5. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
-        macro_info = calculate_macro_regime_slope(rates_df, h1_df)
+        macro_info = calculate_macro_regime_slope(df_m15, df_h1)
         if macro_info.get("regime") != "UNKNOWN":
             if action == "BUY":
                 if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
@@ -164,7 +171,7 @@ class GoldMicroScalperStrategy:
                 return None
 
         # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)
-        ema20_m15 = float(rates_df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        ema20_m15 = float(df_m15["close"].ewm(span=20, adjust=False).mean().iloc[-1])
         if action == "BUY" and mid_price < ema20_m15 * 0.999:
             logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected: Price below M15 EMA20)")
             return None
@@ -173,10 +180,10 @@ class GoldMicroScalperStrategy:
             return None
 
         # 6. ML Meta Gatekeeper Check
-        sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
+        sma20 = df_m15["close"].rolling(20).mean().iloc[-1]
         trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         
-        hist_vols = [calculate_garman_klass_volatility(rates_df.iloc[:i], window=20) for i in range(25, len(rates_df), 5)]
+        hist_vols = [calculate_garman_klass_volatility(df_m15.iloc[:i], window=20) for i in range(25, len(df_m15), 5)]
         median_vol = float(np.median(hist_vols)) if hist_vols else volatility
         vol_ratio = (volatility / median_vol) if median_vol > 0 else 1.0
 
@@ -190,15 +197,15 @@ class GoldMicroScalperStrategy:
             return None
 
         # 6. Session-Aware Dynamic ATR & Volatility Sizing Invariant
-        current_utc = datetime.now(timezone.utc)
+        current_utc = now_utc or datetime.now(timezone.utc)
         ts = market_snapshot.get("time")
-        if ts:
+        if now_utc is None and ts:
             if isinstance(ts, (int, float)):
                 current_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
             elif isinstance(ts, datetime):
                 current_utc = ts
-        elif "time" in rates_df.columns:
-            last_t = rates_df["time"].iloc[-1]
+        elif now_utc is None and "time" in df_m15.columns:
+            last_t = df_m15["time"].iloc[-1]
             if isinstance(last_t, pd.Timestamp):
                 current_utc = last_t.to_pydatetime()
             elif isinstance(last_t, (int, float)):
@@ -214,10 +221,10 @@ class GoldMicroScalperStrategy:
             sl_multiplier = self.config.get("sl_multiplier", 1.5)
             session_tag = "DEFAULT_SESSION"
 
-        # Compute True Range ATR14
-        high_low = rates_df["high"] - rates_df["low"]
-        high_close = (rates_df["high"] - rates_df["close"].shift(1)).abs()
-        low_close = (rates_df["low"] - rates_df["close"].shift(1)).abs()
+        # Compute True Range ATR14 on closed bars
+        high_low = df_m15["high"] - df_m15["low"]
+        high_close = (df_m15["high"] - df_m15["close"].shift(1)).abs()
+        low_close = (df_m15["low"] - df_m15["close"].shift(1)).abs()
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         atr14 = float(tr.rolling(14).mean().iloc[-1])
         if np.isnan(atr14) or atr14 <= 0:

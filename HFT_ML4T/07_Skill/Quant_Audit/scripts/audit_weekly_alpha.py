@@ -24,9 +24,15 @@ try:
 except ImportError:
     HAS_MT5 = False
 
-DEFAULT_TERMINAL_PATH = r"E:\05_Quant\ML_4_Bot\terminals\MT5_GOLD\terminal64.exe"
+DEFAULT_TERMINAL_PATH = r"C:\MT5_Exness\terminal64.exe"
 
 FLEET_MAGIC_MAP: Dict[int, str] = {
+    777001: "XAUUSDm_GOLD",
+    777002: "GBPUSDm_FX",
+    777003: "EURUSDm_FX",
+    777004: "BTCUSDm_CRYPTO",
+    777005: "USOILm_OIL",
+    777006: "US30m_INDEX",
     260901: "FX_D1",
     260902: "USIDX_SESS",
     260903: "GOLD_SESS",

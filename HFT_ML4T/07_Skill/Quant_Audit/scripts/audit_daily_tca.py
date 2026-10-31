@@ -26,11 +26,17 @@ try:
 except ImportError:
     HAS_MT5 = False
 
-DEFAULT_TERMINAL_PATH = r"E:\05_Quant\ML_4_Bot\terminals\MT5_GOLD\terminal64.exe"
-DEFAULT_LOG_PATH = Path("c:/Word_Quant/05_Quant/05_ALL_Bot/All_Fleet_Bot/logs/fleet.log")
-HWM_FILE = Path("E:/05_Quant/ML_4_Bot/data/mt5/monitor/account_hwm.json")
+DEFAULT_TERMINAL_PATH = r"C:\MT5_Exness\terminal64.exe"
+DEFAULT_LOG_PATH = Path("C:/VPS CONTABO/HFT_ML4T/logs/hft_live_2026-10-27.log.2026-10-30")
+HWM_FILE = Path("C:/VPS CONTABO/HFT_ML4T/data/account_hwm.json")
 
 FLEET_MAGIC_MAP: Dict[int, str] = {
+    777001: "XAUUSDm_GOLD",
+    777002: "GBPUSDm_FX",
+    777003: "EURUSDm_FX",
+    777004: "BTCUSDm_CRYPTO",
+    777005: "USOILm_OIL",
+    777006: "US30m_INDEX",
     260901: "FX_D1",
     260902: "USIDX_SESS",
     260903: "GOLD_SESS",

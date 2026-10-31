@@ -60,6 +60,9 @@ class CryptoMicroScalperStrategy:
 
         self.cusum_filter = CUSUMEventFilter(threshold_multiplier=1.8)
         self.gatekeeper = MLMetaGatekeeper(veto_threshold=0.80)
+        self.sl_multiplier = config.get("sl_multiplier", 1.5)
+        self.tp_multiplier = config.get("tp_multiplier", 3.2)
+        self.digits = config.get("digits", 2)
         
         sizing_cfg = config.get("position_sizing", {})
         self.position_sizer = PositionSizer(
@@ -75,6 +78,36 @@ class CryptoMicroScalperStrategy:
             self._last_log_times[key] = now_ts
             logger.info(msg)
 
+    def calculate_triple_barriers(self, entry_price: float, side: int, closed_rates_df: pd.DataFrame) -> tuple[float, float]:
+        """
+        Tính SL/TP dựa trên ATR(14) của chuỗi nến M15 ĐÃ ĐÓNG (iloc[:-1]),
+        loại bỏ hiện tượng SL siêu hẹp từ Garman-Klass 1 nến.
+        """
+        high = closed_rates_df["high"]
+        low = closed_rates_df["low"]
+        prev_close = closed_rates_df["close"].shift(1)
+
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+
+        atr_14 = float(tr.rolling(window=14).mean().iloc[-1])
+        if np.isnan(atr_14) or atr_14 <= 0:
+            atr_14 = entry_price * 0.0025
+
+        min_atr_floor = entry_price * self.config.get("min_sl_distance_pct", 0.0020)
+        effective_atr = max(atr_14, min_atr_floor)
+
+        sl_dist = effective_atr * self.sl_multiplier
+        tp_dist = effective_atr * self.tp_multiplier
+
+        if side == 1:  # BUY
+            return round(entry_price - sl_dist, self.digits), round(entry_price + tp_dist, self.digits)
+        else:          # SELL
+            return round(entry_price + sl_dist, self.digits), round(entry_price - tp_dist, self.digits)
+
     def evaluate(
         self,
         rates_df: pd.DataFrame,
@@ -86,13 +119,19 @@ class CryptoMicroScalperStrategy:
         lot_step: float = 0.01,
         risk_multiplier: float = 1.0,
         h1_df: Optional[pd.DataFrame] = None,
-        ema200_h1: Optional[float] = None
+        ema200_h1: Optional[float] = None,
+        closed_rates_df: Optional[pd.DataFrame] = None,
+        closed_h1_df: Optional[pd.DataFrame] = None,
+        now_utc: Optional[datetime] = None,
+        is_new_bar: Optional[bool] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluates incoming market data for an optimal HFT order on Bitcoin.
         Returns trade instruction dict or None if no trade.
         """
-        if rates_df is None or len(rates_df) < 25:
+        df_m15 = closed_rates_df if closed_rates_df is not None else rates_df
+        df_h1 = closed_h1_df if closed_h1_df is not None else h1_df
+        if df_m15 is None or len(df_m15) < 25:
             return None
 
         mid_price = market_snapshot.get("mid", 0.0)
@@ -102,9 +141,9 @@ class CryptoMicroScalperStrategy:
 
         # 0. Volume Filter: Volume >= min_multiplier * SMA(Volume, 20)
         vol_ratio = 1.0
-        if "tick_volume" in rates_df.columns and len(rates_df) >= (self.volume_sma_period + 1):
-            curr_vol = float(rates_df["tick_volume"].iloc[-1])
-            vol_sma20 = float(rates_df["tick_volume"].iloc[-(self.volume_sma_period + 1):-1].mean())
+        if "tick_volume" in df_m15.columns and len(df_m15) >= (self.volume_sma_period + 1):
+            curr_vol = float(df_m15["tick_volume"].iloc[-1])
+            vol_sma20 = float(df_m15["tick_volume"].iloc[-(self.volume_sma_period + 1):-1].mean())
             if vol_sma20 > 0:
                 vol_ratio = curr_vol / vol_sma20
             if self.volume_filter_enabled and vol_sma20 > 0 and curr_vol < (self.volume_min_multiplier * vol_sma20):
@@ -115,22 +154,22 @@ class CryptoMicroScalperStrategy:
                 )
                 return None
 
-        # 1. Garman-Klass Volatility
-        volatility = calculate_garman_klass_volatility(rates_df, window=20)
+        # 1. Garman-Klass Volatility on closed bars
+        volatility = calculate_garman_klass_volatility(df_m15, window=20)
 
         # 2. Institutional Order Flow Imbalance (OFI) proxy (ML4T Ch. 21)
-        ofi = calculate_order_flow_imbalance(rates_df, window=5)
+        ofi = calculate_order_flow_imbalance(df_m15, window=5)
 
         # 2.5 Time-of-Day Filter (Thin Night Liquidity 20:00 - 02:00 UTC)
-        current_utc = datetime.now(timezone.utc)
+        current_utc = now_utc or datetime.now(timezone.utc)
         ts = market_snapshot.get("time")
-        if ts:
+        if now_utc is None and ts:
             if isinstance(ts, (int, float)):
                 current_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
             elif isinstance(ts, datetime):
                 current_utc = ts
-        elif "time" in rates_df.columns:
-            last_t = rates_df["time"].iloc[-1]
+        elif now_utc is None and "time" in df_m15.columns:
+            last_t = df_m15["time"].iloc[-1]
             if isinstance(last_t, pd.Timestamp):
                 current_utc = last_t.to_pydatetime()
             elif isinstance(last_t, (int, float)):
@@ -152,9 +191,10 @@ class CryptoMicroScalperStrategy:
         reservation_price = quotes["reservation_price"]
         skew_offset = quotes["skew_offset"]
 
-        # 4. CUSUM Event Check
-        ret = float(np.log(rates_df["close"].iloc[-1] / rates_df["close"].iloc[-2]))
-        is_event, direction = self.cusum_filter.update(ret, volatility)
+        # 4. CUSUM Event Check (Strictly deduplicated per closed bar timestamp)
+        ret = float(np.log(df_m15["close"].iloc[-1] / df_m15["close"].iloc[-2]))
+        bar_t = df_m15["time"].iloc[-1] if "time" in df_m15.columns else None
+        is_event, direction = self.cusum_filter.update(ret, volatility, bar_time=bar_t, sym=self.symbol)
 
         # Signal Generation Logic with Dynamic OFI Threshold
         action = None
@@ -193,7 +233,7 @@ class CryptoMicroScalperStrategy:
             return None
 
         # 5. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
-        macro_info = calculate_macro_regime_slope(rates_df, h1_df)
+        macro_info = calculate_macro_regime_slope(df_m15, df_h1)
         if macro_info.get("regime") != "UNKNOWN":
             if action == "BUY":
                 if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
@@ -219,11 +259,11 @@ class CryptoMicroScalperStrategy:
                 self._log_throttled("H1_TREND_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected above H1 EMA200)")
                 return None
 
-        # Tier 2: Multi-Timeframe Trend Consensus (H1 & H4 Alignment)
-        if h1_df is not None and len(h1_df) >= 50:
-            h1_close = float(h1_df["close"].iloc[-1])
-            h1_ema50 = float(h1_df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
-            h1_ema200 = float(h1_df["close"].ewm(span=200, adjust=False).mean().iloc[-1]) if len(h1_df) >= 100 else h1_ema50
+        # Tier 2: Multi-Timeframe Trend Consensus (H1 & H4 Alignment on Closed Bars)
+        if df_h1 is not None and len(df_h1) >= 50:
+            h1_close = float(df_h1["close"].iloc[-1])
+            h1_ema50 = float(df_h1["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            h1_ema200 = float(df_h1["close"].ewm(span=200, adjust=False).mean().iloc[-1]) if len(df_h1) >= 100 else h1_ema50
             if action == "BUY" and not (h1_close > h1_ema50 and h1_ema50 >= h1_ema200 * 0.995):
                 self._log_throttled("MULTI_TF_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MULTI_TF_MISMATCH (BUY rejected: H1 Close/EMA50 below EMA200)")
                 return None
@@ -232,7 +272,7 @@ class CryptoMicroScalperStrategy:
                 return None
 
         # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)
-        ema20_m15 = float(rates_df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        ema20_m15 = float(df_m15["close"].ewm(span=20, adjust=False).mean().iloc[-1])
         if action == "BUY" and mid_price < ema20_m15 * 0.999:
             self._log_throttled("H1_TREND_MISMATCH", f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected: Price below M15 EMA20)")
             return None
@@ -241,10 +281,10 @@ class CryptoMicroScalperStrategy:
             return None
 
         # 6. ML Meta Gatekeeper Check
-        sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
+        sma20 = df_m15["close"].rolling(20).mean().iloc[-1]
         trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         
-        hist_vols = [calculate_garman_klass_volatility(rates_df.iloc[:i], window=20) for i in range(25, len(rates_df), 5)]
+        hist_vols = [calculate_garman_klass_volatility(df_m15.iloc[:i], window=20) for i in range(25, len(df_m15), 5)]
         median_vol = float(np.median(hist_vols)) if hist_vols else volatility
         vol_ratio = (volatility / median_vol) if median_vol > 0 else 1.0
 
@@ -257,13 +297,12 @@ class CryptoMicroScalperStrategy:
             logger.debug(f"[BTC_ORACLE] {gate_msg}")
             return None
 
-        # 6. Triple-Barrier Dynamic SL / TP
-        sl_price, tp_price = calculate_triple_barriers(
+        # 6. Triple-Barrier Dynamic SL / TP using Closed-Bar ATR(14)
+        side_int = 1 if action == "BUY" else -1
+        sl_price, tp_price = self.calculate_triple_barriers(
             entry_price=mid_price,
-            volatility=volatility,
-            action=action,
-            sl_multiplier=self.config.get("sl_multiplier", 1.8),
-            tp_multiplier=self.config.get("tp_multiplier", 2.8)
+            side=side_int,
+            closed_rates_df=df_m15
         )
 
         # 7. Safe Lot Sizing with Quantization Guard & Nautilus De-risking Multiplier

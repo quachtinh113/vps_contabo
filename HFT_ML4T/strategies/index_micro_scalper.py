@@ -52,6 +52,9 @@ class IndexMicroScalperStrategy:
         )
         self.cusum_filter = CUSUMEventFilter(threshold_multiplier=1.7)
         self.gatekeeper = MLMetaGatekeeper(veto_threshold=0.80)
+        self.sl_multiplier = config.get("sl_multiplier", 1.5)
+        self.tp_multiplier = config.get("tp_multiplier", 2.8)
+        self.digits = config.get("digits", 1)
         
         trend_cfg = config.get("trend_filter", {})
         self.h1_ema_period = trend_cfg.get("h1_ema_period", 50)
@@ -64,6 +67,61 @@ class IndexMicroScalperStrategy:
             max_lot_cap=sizing_cfg.get("max_lot_cap", 0.20)  # Safe cap for index contract
         )
 
+    def is_session_active(self, now_utc: datetime, live_tick: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Kiểm tra giờ phiên giao dịch US30m theo đồng hồ thực UTC và độ tươi của tick,
+        chặn triệt để lỗi 10018 (Market Closed).
+        """
+        # Bắt buộc kiểm tra Thứ Bảy / Chủ Nhật theo đồng hồ thực UTC
+        if now_utc.weekday() >= 5:
+            return False
+
+        if live_tick:
+            # Kiểm tra độ tươi của tick (Stale Tick Guard): Nếu tick cuối cùng cách hiện tại > 30 giây -> Thị trường đã đóng
+            if "time_msc" in live_tick and live_tick["time_msc"]:
+                tick_time_utc = float(live_tick["time_msc"]) / 1000.0
+                if (now_utc.timestamp() - tick_time_utc) > 30.0:
+                    return False
+            elif "time" in live_tick and isinstance(live_tick["time"], (int, float)):
+                if (now_utc.timestamp() - float(live_tick["time"])) > 30.0:
+                    return False
+
+        if self.trading_session_utc and len(self.trading_session_utc) == 2:
+            current_hm = now_utc.strftime("%H:%M")
+            start_hm, end_hm = self.trading_session_utc  # ["13:30", "20:30"]
+            return start_hm <= current_hm <= end_hm
+        return True
+
+    def calculate_triple_barriers(self, entry_price: float, side: int, closed_rates_df: pd.DataFrame) -> tuple[float, float]:
+        """
+        Tính SL/TP dựa trên ATR(14) của chuỗi nến M15 ĐÃ ĐÓNG (iloc[:-1]),
+        loại bỏ hiện tượng SL siêu hẹp từ Garman-Klass 1 nến.
+        """
+        high = closed_rates_df["high"]
+        low = closed_rates_df["low"]
+        prev_close = closed_rates_df["close"].shift(1)
+
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+
+        atr_14 = float(tr.rolling(window=14).mean().iloc[-1])
+        if np.isnan(atr_14) or atr_14 <= 0:
+            atr_14 = entry_price * 0.0020
+
+        min_atr_floor = entry_price * self.config.get("min_sl_distance_pct", 0.0015)
+        effective_atr = max(atr_14, min_atr_floor)
+
+        sl_dist = effective_atr * self.sl_multiplier
+        tp_dist = effective_atr * self.tp_multiplier
+
+        if side == 1:  # BUY
+            return round(entry_price - sl_dist, self.digits), round(entry_price + tp_dist, self.digits)
+        else:          # SELL
+            return round(entry_price + sl_dist, self.digits), round(entry_price - tp_dist, self.digits)
+
     def evaluate(
         self,
         rates_df: pd.DataFrame,
@@ -75,13 +133,19 @@ class IndexMicroScalperStrategy:
         lot_step: float = 0.01,
         risk_multiplier: float = 1.0,
         h1_df: Optional[pd.DataFrame] = None,
-        ema200_h1: Optional[float] = None
+        ema200_h1: Optional[float] = None,
+        closed_rates_df: Optional[pd.DataFrame] = None,
+        closed_h1_df: Optional[pd.DataFrame] = None,
+        now_utc: Optional[datetime] = None,
+        is_new_bar: Optional[bool] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluates incoming market data for an optimal HFT order on US30.
         Returns trade instruction dict or None if no trade.
         """
-        if rates_df is None or len(rates_df) < 25:
+        df_m15 = closed_rates_df if closed_rates_df is not None else rates_df
+        df_h1 = closed_h1_df if closed_h1_df is not None else h1_df
+        if df_m15 is None or len(df_m15) < 25:
             return None
 
         mid_price = market_snapshot.get("mid", 0.0)
@@ -89,34 +153,34 @@ class IndexMicroScalperStrategy:
         if mid_price <= 0 or spread_pts > self.max_spread_points:
             return None
 
-        # 0. Session Filter: US30 Index Peak Liquidity Hours (13:00 - 21:00 UTC)
-        if self.trading_session_utc and len(self.trading_session_utc) == 2:
+        # 0. Session Filter: US30 Index Peak Liquidity Hours (13:30 - 20:30 UTC) + Stale Tick Guard
+        if now_utc is not None:
+            if not self.is_session_active(now_utc, market_snapshot):
+                return None
+        elif self.trading_session_utc and len(self.trading_session_utc) == 2:
             start_utc, end_utc = self.trading_session_utc
             ts = market_snapshot.get("time")
             bar_time = None
-            if ts:
-                if isinstance(ts, (int, float)):
-                    bar_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-                elif isinstance(ts, datetime):
-                    bar_time = ts
-            elif rates_df is not None and "time" in rates_df.columns:
-                last_t = rates_df["time"].iloc[-1]
-                if isinstance(last_t, pd.Timestamp):
-                    bar_time = last_t.to_pydatetime()
-                elif isinstance(last_t, (int, float)):
-                    bar_time = datetime.fromtimestamp(last_t, tz=timezone.utc)
+            if isinstance(ts, datetime):
+                bar_time = ts
+            else:
+                bar_time = datetime.now(timezone.utc)
+                if isinstance(ts, (int, float)) and (bar_time.timestamp() - float(ts)) > 30.0:
+                    return None
 
             if bar_time:
+                if bar_time.weekday() >= 5:
+                    return None
                 hm_str = bar_time.strftime("%H:%M")
                 if not (start_utc <= hm_str <= end_utc):
                     logger.debug(f"[US30_PULSE] Session filter skip: {hm_str} UTC outside {start_utc}-{end_utc}")
                     return None
 
-        # 1. Garman-Klass Volatility
-        volatility = calculate_garman_klass_volatility(rates_df, window=20)
+        # 1. Garman-Klass Volatility on closed bars
+        volatility = calculate_garman_klass_volatility(df_m15, window=20)
 
         # 2. Institutional Order Flow Imbalance (OFI) proxy (ML4T Ch. 21)
-        ofi = calculate_order_flow_imbalance(rates_df, window=5)
+        ofi = calculate_order_flow_imbalance(df_m15, window=5)
 
         # 3. Avellaneda-Stoikov Reservation Pricing
         quotes = self.as_engine.calculate_quotes(
@@ -129,9 +193,10 @@ class IndexMicroScalperStrategy:
         reservation_price = quotes["reservation_price"]
         skew_offset = quotes["skew_offset"]
 
-        # 4. CUSUM Event Check
-        ret = float(np.log(rates_df["close"].iloc[-1] / rates_df["close"].iloc[-2]))
-        is_event, direction = self.cusum_filter.update(ret, volatility)
+        # 4. CUSUM Event Check (Strictly deduplicated per closed bar timestamp)
+        ret = float(np.log(df_m15["close"].iloc[-1] / df_m15["close"].iloc[-2]))
+        bar_t = df_m15["time"].iloc[-1] if "time" in df_m15.columns else None
+        is_event, direction = self.cusum_filter.update(ret, volatility, bar_time=bar_t, sym=self.symbol)
 
         # Signal Logic
         action = None
@@ -158,12 +223,12 @@ class IndexMicroScalperStrategy:
             )
             return None
 
-        # 5. Mandatory H1 Trend Filter (Close_H1 > EMA50_H1 OR Close_H1 > DonchianMid_H1)
-        if h1_df is not None and len(h1_df) >= max(self.h1_ema_period, self.donchian_period):
-            close_h1 = float(h1_df["close"].iloc[-1])
-            ema50_h1 = float(h1_df["close"].ewm(span=self.h1_ema_period, adjust=False).mean().iloc[-1])
-            donchian_high = float(h1_df["high"].iloc[-self.donchian_period:].max())
-            donchian_low = float(h1_df["low"].iloc[-self.donchian_period:].min())
+        # 5. Mandatory H1 Trend Filter (Close_H1 > EMA50_H1 OR Close_H1 > DonchianMid_H1 on Closed Bars)
+        if df_h1 is not None and len(df_h1) >= max(self.h1_ema_period, self.donchian_period):
+            close_h1 = float(df_h1["close"].iloc[-1])
+            ema50_h1 = float(df_h1["close"].ewm(span=self.h1_ema_period, adjust=False).mean().iloc[-1])
+            donchian_high = float(df_h1["high"].iloc[-self.donchian_period:].max())
+            donchian_low = float(df_h1["low"].iloc[-self.donchian_period:].min())
             donchian_mid = (donchian_high + donchian_low) / 2.0
 
             if action == "BUY":
@@ -184,7 +249,7 @@ class IndexMicroScalperStrategy:
                     return None
 
         # 5.1 Institutional Multi-Horizon Macro Regime & Velocity Gating
-        macro_info = calculate_macro_regime_slope(rates_df, h1_df)
+        macro_info = calculate_macro_regime_slope(df_m15, df_h1)
         if macro_info.get("regime") != "UNKNOWN":
             if action == "BUY":
                 if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
@@ -209,10 +274,10 @@ class IndexMicroScalperStrategy:
                 return None
 
         # 5.2 Block Consecutive Impulse Bars (Never catch falling knives / chasing spikes)
-        if len(rates_df) >= 3:
-            b1 = rates_df.iloc[-2]
-            b2 = rates_df.iloc[-3]
-            curr = rates_df.iloc[-1]
+        if len(df_m15) >= 3:
+            b1 = df_m15.iloc[-2]
+            b2 = df_m15.iloc[-3]
+            curr = df_m15.iloc[-1]
             
             if action == "BUY":
                 is_falling_knife = (b2["close"] < b2["open"]) and (b1["close"] < b1["open"]) and (b1["close"] < b2["close"])
@@ -233,9 +298,9 @@ class IndexMicroScalperStrategy:
                     return None
 
         # 5.3 M15 Pullback Trigger Confirmation
-        ema20_m15 = float(rates_df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        ema20_m15 = float(df_m15["close"].ewm(span=20, adjust=False).mean().iloc[-1])
         if action == "BUY":
-            recent_lows = rates_df["low"].iloc[-4:]
+            recent_lows = df_m15["low"].iloc[-4:]
             had_pullback = any(low_val <= (ema20_m15 * 1.002) for low_val in recent_lows)
             if not had_pullback or mid_price < (ema20_m15 * 0.999):
                 logger.info(
@@ -244,7 +309,7 @@ class IndexMicroScalperStrategy:
                 )
                 return None
         elif action == "SELL":
-            recent_highs = rates_df["high"].iloc[-4:]
+            recent_highs = df_m15["high"].iloc[-4:]
             had_pullback = any(high_val >= (ema20_m15 * 0.998) for high_val in recent_highs)
             if not had_pullback or mid_price > (ema20_m15 * 1.001):
                 logger.info(
@@ -254,10 +319,10 @@ class IndexMicroScalperStrategy:
                 return None
 
         # 6. ML Meta Gatekeeper Check
-        sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
+        sma20 = df_m15["close"].rolling(20).mean().iloc[-1]
         trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         
-        hist_vols = [calculate_garman_klass_volatility(rates_df.iloc[:i], window=20) for i in range(25, len(rates_df), 5)]
+        hist_vols = [calculate_garman_klass_volatility(df_m15.iloc[:i], window=20) for i in range(25, len(df_m15), 5)]
         median_vol = float(np.median(hist_vols)) if hist_vols else volatility
         vol_ratio = (volatility / median_vol) if median_vol > 0 else 1.0
 
@@ -270,13 +335,12 @@ class IndexMicroScalperStrategy:
             logger.debug(f"[US30_PULSE] {gate_msg}")
             return None
 
-        # 6. Triple-Barrier Dynamic SL / TP
-        sl_price, tp_price = calculate_triple_barriers(
+        # 6. Triple-Barrier Dynamic SL / TP using Closed-Bar ATR(14)
+        side_int = 1 if action == "BUY" else -1
+        sl_price, tp_price = self.calculate_triple_barriers(
             entry_price=mid_price,
-            volatility=volatility,
-            action=action,
-            sl_multiplier=self.config.get("sl_multiplier", 1.8),
-            tp_multiplier=self.config.get("tp_multiplier", 2.8)
+            side=side_int,
+            closed_rates_df=df_m15
         )
 
         # 7. Safe Lot Sizing with Quantization Guard & Nautilus De-risking Multiplier

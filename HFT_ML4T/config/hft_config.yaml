@@ -125,11 +125,14 @@ symbols:
     magic: 777005
     timeframe: "M15"
     max_spread_points: 35.0        # Max allowable spread in points (~0.035$, normal spread is 20 pts)
-    sl_multiplier: 1.5
-    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0 (Win rate 61.3%)
+    trading_session_utc: ["07:00", "20:00"]  # Chặn phiên Á (00:00-05:00 UTC) thanh khoản mỏng
+    friday_hard_close_utc: "20:30"           # Bắt buộc đóng toàn bộ lệnh trước khi đóng cửa tuần
+    min_sl_distance_pct: 0.0035              # Sàn bảo vệ tối thiểu 0.35% giá đối với USOILm chống quét nhiễu < 15m
+    sl_multiplier: 2.2             # Nới từ 1.5 lên 2.2 ATR14 (chống whipsaw khung 5-15m)
+    tp_multiplier: 3.3             # Duy trì tỷ lệ R:R tối thiểu 1:1.5
     position_sizing:
-      risk_per_trade_pct: 0.007    # Tăng từ 0.5% lên 0.7% vốn để tối đa hóa lợi nhuận
-      max_lot_cap: 0.12            # Tăng từ 0.08 lên 0.12 lot (120 thùng)
+      risk_per_trade_pct: 0.003    # Giảm từ 0.007 (0.7%) xuống 0.003 (0.3%)
+      max_lot_cap: 0.05            # Hạ trần lot từ 0.12 xuống 0.05 lot để chặn lỗ $50-$65/lệnh
     avellaneda_stoikov:
       gamma: 0.03                  # CPCV Validated (28.1% Divergence)
       kappa: 0.8
@@ -154,6 +157,7 @@ symbols:
     timeframe: "M15"
     max_spread_points: 25.0        # Max allowable spread in points (~2.5$, normal spread is 10 pts)
     trading_session_utc: ["13:30", "20:30"] # US Cash Session Gate: Prevents outside-hours closed market attempts
+    friday_hard_close_utc: "20:30"
     sl_multiplier: 1.5
     tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87 (Win rate 55.4%)
     position_sizing:
@@ -193,16 +197,16 @@ symbols:
       ofi_sensitivity: 0.25
 
   - name: "GBPUSDm"
-    enabled: true                  # Bật lại để khai thác vi mô phiên London/New York
+    enabled: false                 # Tạm ngưng do Sharpe 7d = -2.75, WR = 34.1% trong HIGH_VOL_MEAN_REVERTING
     strategy_type: "fx"
     magic: 777002
     timeframe: "M15"
     max_spread_points: 18.0
-    sl_multiplier: 1.3
-    tp_multiplier: 2.5
+    sl_multiplier: 2.0             # Nới từ 1.3 lên 2.0 ATR14
+    tp_multiplier: 3.0
     position_sizing:
-      risk_per_trade_pct: 0.005
-      max_lot_cap: 0.10
+      risk_per_trade_pct: 0.002    # Hạ dự phòng từ 0.005 xuống 0.002 (0.2%)
+      max_lot_cap: 0.05
     avellaneda_stoikov:
       gamma: 0.10
       kappa: 2.0

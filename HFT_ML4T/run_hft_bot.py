@@ -169,6 +169,9 @@ def main():
     global_ladder_cfg = risk_cfg.get("profit_ladder", {})
     last_close_attempts = {}  # ticket -> last_attempt_ts
     tracked_positions = {}  # ticket -> (symbol, open_price, type, magic)
+    last_closed_m15_ts: dict[str, int] = {}
+    inflight_order_lock: dict[str, float] = {}  # {symbol: unix_timestamp_unlock}
+    DUPLICATE_GUARD_SEC = 60.0
     last_status_print = 0.0
 
     logger.info("⚡ HFT_ML4T Engine running loop started. Press Ctrl+C to terminate.")
@@ -361,23 +364,48 @@ def main():
                 if not _running:
                     break
 
+                now_utc_dt = datetime.now(timezone.utc)
+                now_ts = time.time()
+
+                # 1. HARD WEEKEND / OVERNIGHT FLATTEN GUARD (Chặn lỗ qua tuần như lệnh USOILm -$153)
+                friday_close_hm = strat.config.get("friday_hard_close_utc", "20:30")
+                if "BTC" not in sym.upper() and now_utc_dt.weekday() == 4 and now_utc_dt.strftime("%H:%M") >= friday_close_hm:
+                    sym_open_positions = [p for p in open_pos_all if p.symbol == sym and p.magic == strat.magic]
+                    for pos in sym_open_positions:
+                        if now_ts - last_close_attempts.get(pos.ticket, 0) >= 60.0:
+                            last_close_attempts[pos.ticket] = now_ts
+                            logger.info(f"🛑 [FRIDAY_HARD_EXIT] Flattening Ticket #{pos.ticket} {sym} before weekend close ({friday_close_hm} UTC)")
+                            mt5_bridge.close_position(pos, comment="FRIDAY_HARD_EXIT")
+                    continue
+
+                # Block weekend trading on non-crypto symbols
+                if "BTC" not in sym.upper() and now_utc_dt.weekday() >= 5:
+                    continue
+
+                # 2. LOCAL IN-MEMORY ANTI-DUPLICATE LOCK (Chặn Race Condition < 1s)
+                if now_ts < inflight_order_lock.get(sym, 0.0):
+                    continue
+
                 snapshot = mt5_bridge.get_market_snapshot(sym)
                 if not snapshot:
                     continue
 
-                # Market freshness / Weekend check: Skip traditional assets if market is closed (ticks older than 180s)
-                tick_age = loop_start - snapshot.get("time", 0)
-                if tick_age > 180 and "BTC" not in sym.upper():
+                # Market freshness / Stale Tick Guard: Skip traditional assets if market is closed (ticks older than 30s for US30, 180s for others)
+                tick_age = now_ts - snapshot.get("time", 0)
+                max_tick_age = 30.0 if "US30" in sym.upper() else 180.0
+                if tick_age > max_tick_age and "BTC" not in sym.upper():
                     continue
 
-                # Trading Session Gate for US30m (US Cash Session: 13:30 - 20:30 UTC)
-                if "US30" in sym.upper():
-                    now_utc_dt = datetime.now(timezone.utc)
-                    hm_str = now_utc_dt.strftime("%H:%M")
-                    if not ("13:30" <= hm_str <= "20:30"):
+                # Trading Session Gate for US30m & Session-Restricted Assets
+                hm_str = now_utc_dt.strftime("%H:%M")
+                session_window = strat.config.get("trading_session_utc")
+                if session_window and len(session_window) == 2:
+                    if not (session_window[0] <= hm_str <= session_window[1]):
                         continue
 
                 sym_positions = [p for p in open_pos_all if p.symbol == sym and p.magic == strat.magic]
+                if len(sym_positions) >= risk_cfg.get("max_positions_per_symbol", 1):
+                    continue
 
                 # Current net inventory
                 net_inventory = 0.0
@@ -396,12 +424,23 @@ def main():
                 if not is_safe:
                     continue
 
-                # Fetch candle history
-                # Fetch candle history (M15 execution + H1 Macro Trend)
-                rates_df = mt5_bridge.get_rates_df(sym, timeframe=strat.config.get("timeframe", "M15"), count=100)
-                if rates_df is None:
-                    continue
+                # 3. LẤY DỮ LIỆU NẾN & TÁCH BIỆT NẾN ĐÃ ĐÓNG (iloc[:-1]) VS NẾN ĐANG CHẠY (iloc[-1])
+                rates_df = mt5_bridge.get_rates_df(sym, timeframe=strat.config.get("timeframe", "M15"), count=105)
                 rates_h1 = mt5_bridge.get_rates_df(sym, timeframe="H1", count=250)
+                if rates_df is None or len(rates_df) < 50 or rates_h1 is None or len(rates_h1) < 55:
+                    continue
+
+                # Rule #2 Compliance: Chỉ truyền các nến ĐÃ ĐÓNG hoàn toàn vào bộ lọc xu hướng & CUSUM
+                closed_m15_df = rates_df.iloc[:-1].copy()
+                closed_h1_df = rates_h1.iloc[:-1].copy()
+                raw_last_t = closed_m15_df["time"].iloc[-1]
+                latest_closed_bar_ts = int(raw_last_t.timestamp()) if hasattr(raw_last_t, "timestamp") else int(raw_last_t)
+
+                is_new_m15_bar = (last_closed_m15_ts.get(sym) != latest_closed_bar_ts)
+                if is_new_m15_bar:
+                    last_closed_m15_ts[sym] = latest_closed_bar_ts
+                    if hasattr(strat, "cusum_filter"):
+                        strat.cusum_filter.update_on_closed_bar(sym, closed_m15_df)
 
                 sym_info = mt5_bridge.get_symbol_info(sym)
                 contract_size = sym_info.trade_contract_size if sym_info else 100.0
@@ -416,7 +455,7 @@ def main():
                     continue
 
                 signal_res = strat.evaluate(
-                    rates_df=rates_df,
+                    rates_df=closed_m15_df,
                     market_snapshot=snapshot,
                     current_inventory=net_inventory,
                     account_equity=acc["equity"],
@@ -424,7 +463,11 @@ def main():
                     min_lot=min_lot,
                     lot_step=lot_step,
                     risk_multiplier=effective_risk_mult,
-                    h1_df=rates_h1
+                    h1_df=closed_h1_df,
+                    closed_rates_df=closed_m15_df,
+                    closed_h1_df=closed_h1_df,
+                    now_utc=now_utc_dt,
+                    is_new_bar=is_new_m15_bar
                 )
 
                 if signal_res:
@@ -441,6 +484,9 @@ def main():
                     )
 
                     if live_trading_env:
+                        # Khóa ngay lập tức TRƯỚC khi gửi lệnh qua mạng để tránh tick kế tiếp lọt qua (< 1s race condition)
+                        inflight_order_lock[sym] = time.time() + DUPLICATE_GUARD_SEC
+
                         # Real money order dispatch with expected reservation price telemetry
                         target_exp_price = signal_res.get("reservation_price") or snapshot.get("mid", 0.0)
                         success, msg, ticket = mt5_bridge.send_order(
@@ -468,8 +514,12 @@ def main():
 
                         if success:
                             risk_desk.consume_recovery_trade(sym)
+                            risk_desk.trigger_cooldown(sym, duration_sec=DUPLICATE_GUARD_SEC, reason="Post-Fill Anti-Duplicate Guard")
+                            open_pos_all = mt5_bridge.get_open_positions()
                         else:
                             logger.warning(f"⚠️ [ORDER REJECTED BY BROKER/MT5] {sym}: {msg}")
+                            if not ("10018" in str(msg) or "10027" in str(msg)):
+                                inflight_order_lock[sym] = time.time() + 5.0
                     else:
                         logger.info(f"🛡️ [PAPER TRADE ONLY] Order suppressed because LIVE_TRADING=false")
                         signal_res["execution_status"] = "PAPER_SIMULATED"
