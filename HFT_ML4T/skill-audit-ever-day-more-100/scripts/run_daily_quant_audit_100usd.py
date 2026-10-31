@@ -9,7 +9,8 @@ from pathlib import Path
 
 UNIVERSAL_ENGINE_PATH = (
     Path(__file__).resolve().parents[2]
-    / "institutional-quant-audit"
+    / "07_Skill"
+    / "Quant_Audit"
     / "scripts"
     / "audit_any_bot.py"
 )

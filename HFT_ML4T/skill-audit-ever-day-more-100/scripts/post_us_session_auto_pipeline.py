@@ -28,23 +28,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-WORKSPACE_ROOT = Path("c:/Word_Quant/05_Quant")
-ALL_BOT_DIR = WORKSPACE_ROOT / "05_ALL_Bot"
-REPORT_ARCHIVE_DIR = ALL_BOT_DIR / "logs" / "daily_audit_reports"
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+ALL_BOT_DIR = WORKSPACE_ROOT
+REPORT_ARCHIVE_DIR = WORKSPACE_ROOT / "logs" / "daily_audit_reports"
 UNIVERSAL_AUDIT_SCRIPT = (
     WORKSPACE_ROOT
-    / ".agents"
-    / "skills"
-    / "institutional-quant-audit"
+    / "07_Skill"
+    / "Quant_Audit"
     / "scripts"
     / "audit_any_bot.py"
 )
 
 CANDIDATE_BOT_ENTRYPOINTS: List[Tuple[str, Path]] = [
-    ("All_Fleet_Bot", ALL_BOT_DIR / "All_Fleet_Bot" / "run_unified_bot.py"),
-    ("Work_Quant", ALL_BOT_DIR / "Work_Quant" / "pipeline_live.py"),
-    ("WuWei Core", ALL_BOT_DIR / "WuWei Core" / "live_trade.py"),
-    ("US-SESSION-TRADING-SYSTEM", ALL_BOT_DIR / "US-SESSION-TRADING-SYSTEM" / "v9_orchestrator.py"),
+    ("HFT_ML4T", WORKSPACE_ROOT / "run_hft_bot.py"),
 ]
 
 
@@ -115,6 +111,32 @@ def check_and_launch_latest_bot_process(
             "no_regression_gate": nrg.get("verdict", "PASS"),
             "potential_daily_pnl_usd": rec.get("clean_no_bad_loss_avg_daily_pnl_usd", 0.0),
         }
+
+    # Check if run_hft_bot.py is already running under start_bot.bat / Watchdog
+    if os.name == "nt" and entrypoint_path.name == "run_hft_bot.py":
+        ps_check = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'run_hft_bot\\.py' -and $_.Name -match 'python' } | Select-Object -First 1 -ExpandProperty ProcessId",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        existing_pid_str = ps_check.stdout.strip()
+        if existing_pid_str.isdigit():
+            return {
+                "relaunch_status": "RUNNING_ACTIVE (SUPERVISED_BY_WATCHDOG)",
+                "pid": int(existing_pid_str),
+                "bot_name": bot_name,
+                "entrypoint": str(entrypoint_path),
+                "last_modified": datetime.fromtimestamp(entrypoint_path.stat().st_mtime).isoformat(),
+                "command": " ".join(cmd_list),
+                "working_dir": str(entrypoint_path.parent),
+                "process_log": str(WORKSPACE_ROOT / "logs" / f"hft_live_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"),
+                "no_regression_gate": nrg.get("verdict", "PASS"),
+            }
 
     creation_flags = 0
     if os.name == "nt":
