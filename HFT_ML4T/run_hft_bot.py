@@ -301,7 +301,7 @@ def main():
                     profit_dist = (p.price_current - p.price_open) if p.type == 0 else (p.price_open - p.price_current)
                     
                     # Nautilus Time-Barrier Exit (Alpha Decay Horizon from Config)
-                    max_holding_bars = risk_cfg.get("max_holding_bars_m15", 2)
+                    max_holding_bars = risk_cfg.get("max_holding_bars_m15", 5)
                     max_holding_sec = max_holding_bars * 15 * 60
                     pos_age_sec = time.time() - p.time
                     if pos_age_sec >= max_holding_sec:

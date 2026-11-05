@@ -46,7 +46,7 @@ risk_desk:
     tier1_lock_ratio: 0.25         # Khóa +25% TP distance làm lợi nhuận chắc chắn
     tier2_trigger_ratio: 0.75      # Khi lãi đạt 75% TP distance
     tier2_lock_ratio: 0.50         # Khóa +50% TP distance
-  max_holding_bars_m15: 2          # Nautilus Alpha Decay Time-Barrier (Tối đa 30 phút - 2 nến M15 chống ngâm lệnh)
+  max_holding_bars_m15: 5          # Nautilus Alpha Decay Time-Barrier (Nới rộng lên 75 phút - 5 nến M15 cho lệnh đủ biên độ chạy TP/Trailing)
 
 symbols:
   # ===================================================================
@@ -156,7 +156,7 @@ symbols:
     magic: 777006
     timeframe: "M15"
     max_spread_points: 25.0        # Max allowable spread in points (~2.5$, normal spread is 10 pts)
-    trading_session_utc: ["13:30", "20:30"] # US Cash Session Gate: Prevents outside-hours closed market attempts
+    trading_session_utc: ["14:00", "20:30"] # US Cash Session Gate: Prevents outside-hours closed market attempts
     friday_hard_close_utc: "20:30"
     sl_multiplier: 1.5
     tp_multiplier: 2.8             # Tỷ lệ R:R 1:1.87 (Win rate 55.4%)

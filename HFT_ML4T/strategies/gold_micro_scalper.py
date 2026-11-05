@@ -46,7 +46,7 @@ class GoldMicroScalperStrategy:
             ofi_sensitivity=as_cfg.get("ofi_sensitivity", 0.25)
         )
         self.cusum_filter = CUSUMEventFilter(threshold_multiplier=1.8)
-        self.gatekeeper = MLMetaGatekeeper(veto_threshold=0.80)
+        self.gatekeeper = MLMetaGatekeeper(veto_threshold=0.60)
         
         # Session-Aware ATR Configuration
         self.session_aware_cfg = config.get("session_aware_atr", {})
@@ -130,6 +130,20 @@ class GoldMicroScalperStrategy:
         elif is_event and (direction * ofi > 0) and abs(ofi) >= 0.15:
             action = "BUY" if direction > 0 else "SELL"
 
+        # 4.1 Anti-Climax Gate: Block chasing extreme exhaustion climaxes (Adverse Selection protection)
+        if action == "SELL" and ofi < -0.70:
+            logger.info(
+                f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: SELLING_CLIMAX_EXHAUSTION "
+                f"(SELL rejected: OFI {ofi:.3f} < -0.70 indicates extreme seller exhaustion / liquidity sweep)"
+            )
+            return None
+        elif action == "BUY" and ofi > 0.85:
+            logger.info(
+                f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: BUYING_CLIMAX_EXHAUSTION "
+                f"(BUY rejected: OFI {ofi:.3f} > 0.85 indicates extreme buyer exhaustion)"
+            )
+            return None
+
         if not action:
             return None
 
@@ -194,6 +208,16 @@ class GoldMicroScalperStrategy:
         )
         if not approved:
             logger.debug(f"[STATE_01] {gate_msg}")
+            return None
+
+                # 5.6 US Macro Economic Release Window Guard (14:20 - 14:45 UTC)
+        cur_dt = now_utc or datetime.now(timezone.utc)
+        cur_hm = cur_dt.strftime("%H:%M")
+        if "14:20" <= cur_hm <= "14:45" and vol_ratio > 1.25:
+            logger.info(
+                f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: MACRO_NEWS_VOLATILITY_SHOCK "
+                f"(Gold trading vetoed during US economic data release: VolRatio {vol_ratio:.2f} > 1.25)"
+            )
             return None
 
         # 6. Session-Aware Dynamic ATR & Volatility Sizing Invariant
@@ -272,5 +296,7 @@ class GoldMicroScalperStrategy:
             "volatility": volatility,
             "ofi": ofi,
             "reservation_price": reservation_price,
-            "risk_score": risk_score
+            "risk_score": risk_score,
+            "macro_regime": macro_info.get("regime", "UNKNOWN") if "macro_info" in locals() else "UNKNOWN",
+            "slope_ema21_pct": float(macro_info.get("slope_ema21_pct", 0.0)) if "macro_info" in locals() else 0.0
         }

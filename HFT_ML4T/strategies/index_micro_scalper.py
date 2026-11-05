@@ -51,7 +51,7 @@ class IndexMicroScalperStrategy:
             ofi_sensitivity=as_cfg.get("ofi_sensitivity", 0.25)
         )
         self.cusum_filter = CUSUMEventFilter(threshold_multiplier=1.7)
-        self.gatekeeper = MLMetaGatekeeper(veto_threshold=0.80)
+        self.gatekeeper = MLMetaGatekeeper(veto_threshold=0.60)
         self.sl_multiplier = config.get("sl_multiplier", 1.5)
         self.tp_multiplier = config.get("tp_multiplier", 2.8)
         self.digits = config.get("digits", 1)
@@ -208,6 +208,20 @@ class IndexMicroScalperStrategy:
         elif is_event and (direction * ofi > 0) and abs(ofi) >= 0.15:
             action = "BUY" if direction > 0 else "SELL"
 
+        # 4.1 Anti-Climax Gate: Block chasing extreme exhaustion climaxes (Adverse Selection protection)
+        if action == "SELL" and ofi < -0.70:
+            logger.info(
+                f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: SELLING_CLIMAX_EXHAUSTION "
+                f"(SELL rejected: OFI {ofi:.3f} < -0.70 indicates extreme seller exhaustion / liquidity sweep)"
+            )
+            return None
+        elif action == "BUY" and ofi > 0.85:
+            logger.info(
+                f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: BUYING_CLIMAX_EXHAUSTION "
+                f"(BUY rejected: OFI {ofi:.3f} > 0.85 indicates extreme buyer exhaustion)"
+            )
+            return None
+
         if not action:
             return None
 
@@ -240,7 +254,7 @@ class IndexMicroScalperStrategy:
                     )
                     return None
             elif action == "SELL":
-                sell_trend_valid = (close_h1 < ema50_h1) or (close_h1 < donchian_mid)
+                sell_trend_valid = (close_h1 < ema50_h1) and (close_h1 <= donchian_mid)
                 if not sell_trend_valid:
                     logger.info(
                         f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
@@ -369,5 +383,7 @@ class IndexMicroScalperStrategy:
             "volatility": volatility,
             "ofi": ofi,
             "reservation_price": reservation_price,
-            "risk_score": risk_score
+            "risk_score": risk_score,
+            "macro_regime": macro_info.get("regime", "UNKNOWN") if "macro_info" in locals() else "UNKNOWN",
+            "slope_ema21_pct": float(macro_info.get("slope_ema21_pct", 0.0)) if "macro_info" in locals() else 0.0
         }
