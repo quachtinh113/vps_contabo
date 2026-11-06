@@ -16,6 +16,8 @@ risk_desk:
   max_total_open_positions: 6      # Global concurrent position limit across all assets
   max_positions_per_symbol: 1      # Max 1 concurrent position per asset
   rollover_curfew_utc: ["21:45", "22:30"]  # Exness daily rollover spread freeze
+  macro_news_window_utc: ["14:15", "14:45"] # Lá chắn tin vĩ mô 14:30 UTC: Chặn mở lệnh mới trên USD-sensitive assets
+  macro_news_symbols: ["XAUUSDm", "US30m", "USOILm", "GBPUSDm"]
   post_sl_cooldown_seconds: 300    # Base Cooldown (5 phút)
   max_daily_loss_per_symbol_usd: 80.0      # Hạn mức chịu lỗ tối đa cho từng Symbol ($80/ngày)
   consecutive_loss_cooldowns: [300, 2700, -1] # Cooldown lũy tiến: 5m -> 45m -> Khóa symbol hết ngày
@@ -57,6 +59,8 @@ symbols:
     strategy_type: "crypto"
     magic: 777004
     timeframe: "M15"
+    trading_session_utc: ["12:00", "22:00"] # Khóa phiên Á (00:00-12:00 UTC) thanh khoản mỏng, chỉ giao dịch phiên Âu-Mỹ
+    max_spread_to_atr_ratio: 0.12           # Chặn vào lệnh khi spread vượt quá 12% ATR14 M15 (tránh quét râu SL)
     max_spread_points: 2500.0      # ~25 USD max spread cap (normal Exness spread is 600 - 1200 pts)
     sl_multiplier: 1.5
     tp_multiplier: 3.2             # Tỷ lệ R:R 1:2.13

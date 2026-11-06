@@ -133,7 +133,9 @@ def main():
         consecutive_loss_cooldowns=tuple(risk_cfg.get("consecutive_loss_cooldowns", [300, 2700, -1])),
         max_trailing_drawdown_pct=risk_cfg.get("max_trailing_drawdown_pct", 0.08),
         max_positions_per_cluster=risk_cfg.get("max_positions_per_cluster", 2),
-        auto_write_halt_file=risk_cfg.get("auto_write_halt_file", True)
+        auto_write_halt_file=risk_cfg.get("auto_write_halt_file", True),
+        macro_news_window_utc=tuple(risk_cfg.get("macro_news_window_utc", ["14:15", "14:45"])),
+        macro_news_symbols=tuple(risk_cfg.get("macro_news_symbols", ["XAUUSDm", "US30m", "USOILm", "GBPUSDm"]))
     )
     risk_desk.update_account_state(acc)
 
@@ -299,20 +301,69 @@ def main():
 
                     tp_dist = abs(p.tp - p.price_open)
                     profit_dist = (p.price_current - p.price_open) if p.type == 0 else (p.price_open - p.price_current)
-                    
-                    # Nautilus Time-Barrier Exit (Alpha Decay Horizon from Config)
+
+                    # Pre-News Macro Window Guard (14:15 - 14:45 UTC)
+                    # Automatically moves SL to Breakeven (+ buffer) for any profitable USD-sensitive position
+                    is_macro_news = risk_desk.is_macro_news_window(now_utc)
+                    if is_macro_news and getattr(p, "profit", 0.0) > 0 and sym_upper in ("XAUUSDM", "US30M", "USOILM", "GBPUSDM"):
+                        if p.type == 0:  # BUY
+                            be_sl = p.price_open + buffer_pts
+                            if p.sl < be_sl:
+                                logger.info(f"🛡️ [PRE-NEWS BREAKEVEN] Ticket #{p.ticket} {p.symbol} BUY in profit (${p.profit:+.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}")
+                                mt5_bridge.modify_position_sl(p, be_sl)
+                        elif p.type == 1:  # SELL
+                            be_sl = p.price_open - buffer_pts
+                            if p.sl > be_sl or p.sl == 0:
+                                logger.info(f"🛡️ [PRE-NEWS BREAKEVEN] Ticket #{p.ticket} {p.symbol} SELL in profit (${p.profit:+.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}")
+                                mt5_bridge.modify_position_sl(p, be_sl)
+
+                    # Nautilus Time-Barrier Exit with Conditional Extension (Alpha Decay Horizon from Config)
                     max_holding_bars = risk_cfg.get("max_holding_bars_m15", 5)
                     max_holding_sec = max_holding_bars * 15 * 60
                     pos_age_sec = time.time() - p.time
                     if pos_age_sec >= max_holding_sec:
-                        now_ts = time.time()
-                        if now_ts - last_close_attempts.get(p.ticket, 0) >= 300:  # retry every 5m if market closed
-                            last_close_attempts[p.ticket] = now_ts
-                            logger.info(f"⏳ [TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/60:.1f}m (Alpha Decay Horizon: {max_holding_sec/60:.0f}m)")
-                            closed_ok, close_msg = mt5_bridge.close_position(p, comment="TIME_BARRIER")
-                            if not closed_ok and ("10018" in str(close_msg) or "closed" in str(close_msg).lower()):
-                                logger.info(f"⏸️ [MARKET_CLOSED] Ticket #{p.ticket} {p.symbol} will auto-close when market opens.")
-                        continue
+                        # Extract H1 trend and M15 OFI for conditional extension check
+                        h1_bullish = None
+                        m15_ofi = None
+                        try:
+                            rates_m15 = mt5_bridge.get_rates_df(p.symbol, timeframe="M15", count=25)
+                            h1_rates = mt5_bridge.get_rates_df(p.symbol, timeframe="H1", count=210)
+                            if rates_m15 is not None and len(rates_m15) >= 20:
+                                from strategies.gold_micro_scalper import calculate_order_flow_imbalance
+                                m15_ofi = float(calculate_order_flow_imbalance(rates_m15.iloc[:-1], window=5))
+                            if h1_rates is not None and len(h1_rates) >= 200:
+                                h1_c = h1_rates["close"].iloc[:-1]
+                                h1_ema50 = float(h1_c.ewm(span=50, adjust=False).mean().iloc[-1])
+                                h1_ema200 = float(h1_c.ewm(span=200, adjust=False).mean().iloc[-1])
+                                h1_bullish = (h1_ema50 > h1_ema200)
+                        except Exception as e_ind:
+                            logger.debug(f"Error computing indicators for conditional time-barrier: {e_ind}")
+
+                        should_close, close_reason = risk_desk.evaluate_conditional_time_barrier(
+                            symbol=p.symbol,
+                            pos_type=p.type,
+                            pos_age_sec=pos_age_sec,
+                            price_open=p.price_open,
+                            price_current=p.price_current,
+                            initial_sl=p.sl,
+                            base_horizon_sec=max_holding_sec,
+                            extended_horizon_sec=max_holding_sec + (30 * 60),  # 105m
+                            h1_trend_bullish=h1_bullish,
+                            m15_ofi=m15_ofi
+                        )
+
+                        if should_close:
+                            now_ts = time.time()
+                            if now_ts - last_close_attempts.get(p.ticket, 0) >= 300:  # retry every 5m if market closed
+                                last_close_attempts[p.ticket] = now_ts
+                                logger.info(f"⏳ [TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/60:.1f}m ({close_reason})")
+                                closed_ok, close_msg = mt5_bridge.close_position(p, comment="TIME_BARRIER")
+                                if not closed_ok and ("10018" in str(close_msg) or "closed" in str(close_msg).lower()):
+                                    logger.info(f"⏸️ [MARKET_CLOSED] Ticket #{p.ticket} {p.symbol} will auto-close when market opens.")
+                            continue
+                        else:
+                            if int(pos_age_sec) % 300 < 5:
+                                logger.info(f"⏳ [TIME-BARRIER EXTENSION] Ticket #{p.ticket} {p.symbol} held {pos_age_sec/60:.1f}m: {close_reason}")
 
                     # Tier 1: Dynamic ATR Trailing Stop with Guaranteed Breakeven Floor
                     trailing_cfg = risk_cfg.get("trailing_stop", {})

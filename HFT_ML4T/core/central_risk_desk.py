@@ -52,7 +52,9 @@ class CentralRiskDesk:
         cluster_map: Optional[Dict[str, list]] = None,
         auto_write_halt_file: bool = True,
         max_acceptable_slippage_points: float = 25.0, # Slippage barrier cap in points
-        max_acceptable_latency_ms: float = 1200.0     # Execution latency barrier cap in ms
+        max_acceptable_latency_ms: float = 1200.0,    # Execution latency barrier cap in ms
+        macro_news_window_utc: Optional[Tuple[str, str]] = None,
+        macro_news_symbols: Tuple[str, ...] = ("XAUUSDM", "US30M", "USOILM", "GBPUSDM")
     ):
         self.max_daily_drawdown_usd = max_daily_drawdown_usd
         self.max_daily_drawdown_pct = max_daily_drawdown_pct
@@ -71,6 +73,8 @@ class CentralRiskDesk:
         self.auto_write_halt_file = auto_write_halt_file
         self.max_acceptable_slippage_points = max_acceptable_slippage_points
         self.max_acceptable_latency_ms = max_acceptable_latency_ms
+        self.macro_news_window_utc = macro_news_window_utc
+        self.macro_news_symbols = {s.upper().replace(".M", "").replace("M", "") + "M" for s in macro_news_symbols}
 
         self._daily_peak_equity = 0.0
         self._all_time_peak_equity = 0.0
@@ -181,7 +185,8 @@ class CentralRiskDesk:
         current_spread_points: float,
         max_allowed_spread_points: float,
         open_positions: list,
-        account_info: Dict[str, Any]
+        account_info: Dict[str, Any],
+        now_utc: Optional[datetime] = None
     ) -> Tuple[bool, str]:
         """
         Executes pre-flight institutional risk checks before any order is submitted.
@@ -250,11 +255,19 @@ class CentralRiskDesk:
                 return False, f"Margin level {margin_level:.1f}% < safe minimum {self.min_margin_level_percent}%"
 
         # 4. Rollover Curfew Check (Avoid severe Exness spread spikes 21:45-22:30 UTC)
-        now_utc = datetime.now(timezone.utc)
-        current_time_str = now_utc.strftime("%H:%M")
+        cur_dt = now_utc or datetime.now(timezone.utc)
+        current_time_str = cur_dt.strftime("%H:%M")
         start_curfew, end_curfew = self.rollover_curfew_utc
         if start_curfew <= current_time_str <= end_curfew:
             return False, f"Rollover Curfew Active ({start_curfew} - {end_curfew} UTC). Spread risk elevated."
+
+        # 4.5 Macro News Release Window Guard (14:15 - 14:45 UTC)
+        # Blocks new entries on USD/macro sensitive assets during major US economic releases (e.g., NFP, CPI)
+        if self.macro_news_window_utc:
+            start_news, end_news = self.macro_news_window_utc
+            sym_clean = symbol.upper().replace(".M", "").replace("M", "") + "M"
+            if (symbol.upper() in self.macro_news_symbols or sym_clean in self.macro_news_symbols) and (start_news <= current_time_str <= end_news):
+                return False, f"Macro News Release Window Active ({start_news} - {end_news} UTC). New {symbol} orders blocked for event risk."
 
         # 5. Live Spread Guard
         if current_spread_points > max_allowed_spread_points:
@@ -496,3 +509,58 @@ class CentralRiskDesk:
         self._daily_symbol_pnl.clear()
         self._symbol_locked_for_day.clear()
         logger.info("[RISK] Central Risk Desk manually unlocked.")
+
+    def is_macro_news_window(self, now_utc: Optional[datetime] = None) -> bool:
+        """Returns True if current time is within US macro data release window (14:15 - 14:45 UTC)."""
+        if not self.macro_news_window_utc:
+            return False
+        dt = now_utc or datetime.now(timezone.utc)
+        hm = dt.strftime("%H:%M")
+        start_news, end_news = self.macro_news_window_utc
+        return start_news <= hm <= end_news
+
+    def evaluate_conditional_time_barrier(
+        self,
+        symbol: str,
+        pos_type: int,
+        pos_age_sec: float,
+        price_open: float,
+        price_current: float,
+        initial_sl: float,
+        base_horizon_sec: float = 4500.0,
+        extended_horizon_sec: float = 6300.0,
+        h1_trend_bullish: Optional[bool] = None,
+        m15_ofi: Optional[float] = None
+    ) -> Tuple[bool, str]:
+        """
+        Evaluates whether an aging position at 75m should be extended by 30m (up to 105m)
+        or closed immediately.
+        Returns (should_close: bool, reason: str).
+        """
+        if pos_age_sec < base_horizon_sec:
+            return False, "WITHIN_BASE_HORIZON"
+
+        if pos_age_sec >= extended_horizon_sec:
+            return True, f"MAX_EXTENDED_HORIZON_REACHED ({pos_age_sec/60:.1f}m >= {extended_horizon_sec/60:.0f}m)"
+
+        profit_dist = (price_current - price_open) if pos_type == 0 else (price_open - price_current)
+        sl_dist = abs(price_open - initial_sl) if initial_sl > 0 else 0.0
+        r_mult = (profit_dist / sl_dist) if sl_dist > 0 else 0.0
+
+        # Slight drawdown (-0.35R <= r_mult <= 0.05R)
+        is_slight_drawdown = (-0.35 <= r_mult <= 0.05)
+
+        trend_aligned = False
+        if pos_type == 0:  # BUY
+            h1_ok = (h1_trend_bullish is True) or (h1_trend_bullish is None)
+            ofi_ok = (m15_ofi is None) or (m15_ofi >= 0.0)
+            trend_aligned = h1_ok and ofi_ok
+        elif pos_type == 1:  # SELL
+            h1_ok = (h1_trend_bullish is False) or (h1_trend_bullish is None)
+            ofi_ok = (m15_ofi is None) or (m15_ofi <= 0.0)
+            trend_aligned = h1_ok and ofi_ok
+
+        if is_slight_drawdown and trend_aligned:
+            return False, f"EXTENDED_HORIZON: Slight drawdown ({r_mult:+.2f}R), H1 trend and OFI aligned. Horizon extended to 105m."
+        else:
+            return True, f"ALPHA_DECAY_EXIT: R-mult={r_mult:+.2f}R, trend_aligned={trend_aligned}"
