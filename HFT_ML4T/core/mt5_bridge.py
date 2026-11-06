@@ -21,7 +21,7 @@ except ImportError:
     mt5 = None
     MT5_AVAILABLE = False
 
-from core.audit_logger import get_logger
+from core.audit_logger import get_logger, log_execution_audit
 
 logger = get_logger()
 
@@ -53,71 +53,162 @@ class MT5Bridge:
         terminal_path: str = "",
         account: int = 0,
         password: str = "",
-        server: str = ""
+        server: str = "",
+        mt5_path: str = ""
     ):
         if self._initialized:
             return
 
-        self.terminal_path = terminal_path or os.getenv("MT5_PATH", "")
-        self.account = account or int(os.getenv("MT5_ACCOUNT", "0"))
+        self.terminal_path = terminal_path or mt5_path or os.getenv("MT5_PATH", "")
+        self.mt5_path = self.terminal_path
+        self.account = int(account or os.getenv("MT5_ACCOUNT", "0"))
         self.password = password or os.getenv("MT5_PASSWORD", "")
         self.server = server or os.getenv("MT5_SERVER", "")
         self.connected = False
         self._last_health_check = 0.0
         self._symbol_cache: Dict[str, Any] = {}
+        self.last_execution_metrics: Optional[Dict[str, Any]] = None
+        self.log_dir: str = "logs"
         self._initialized = True
 
-    def initialize(self) -> bool:
-        """Connects to MT5 terminal and verifies account authentication."""
+    def kill_zombie_terminal(self) -> None:
+        """Bắn hạ tiến trình MT5 bị treo (Zombie) trên Windows và giải phóng tài nguyên mạng."""
+        logger.warning("🧟 [BRIDGE] Killing zombie MT5 terminal (terminal64.exe)...")
+        try:
+            import subprocess
+            subprocess.run(["taskkill", "/F", "/IM", "terminal64.exe"], capture_output=True, check=False)
+        except Exception as e:
+            logger.error(f"[BRIDGE] Error executing taskkill via subprocess: {e}")
+            os.system("taskkill /F /IM terminal64.exe >nul 2>&1")
+        time.sleep(3)  # Đợi hệ điều hành giải phóng cổng mạng & sockets
+
+    def connect_robust(self, max_retries: int = 3) -> bool:
+        """Khởi động và ép buộc đăng nhập lại MT5, tự động diệt zombie nếu phát hiện treo hoặc mất kết nối."""
         if not MT5_AVAILABLE:
             logger.error("MetaTrader5 package is not available in current environment.")
             return False
 
-        init_kwargs: Dict[str, Any] = {}
-        if self.terminal_path and os.path.exists(self.terminal_path):
-            init_kwargs["path"] = self.terminal_path
-        if self.account:
-            init_kwargs["login"] = self.account
-        if self.password:
-            init_kwargs["password"] = self.password
-        if self.server:
-            init_kwargs["server"] = self.server
-        init_kwargs["timeout"] = 15000
+        for attempt in range(1, max_retries + 1):
+            logger.info(f"[BRIDGE] Connection attempt {attempt}/{max_retries}...")
 
-        if not mt5.initialize(**init_kwargs):
-            err = mt5.last_error()
-            logger.error(f"MT5 initialize failed: {err}")
-            return False
+            init_kwargs: Dict[str, Any] = {}
+            term_path = self.terminal_path or self.mt5_path
+            if term_path and os.path.exists(term_path):
+                init_kwargs["path"] = term_path
+            if self.account:
+                init_kwargs["login"] = int(self.account)
+            if self.password:
+                init_kwargs["password"] = self.password
+            if self.server:
+                init_kwargs["server"] = self.server
+            init_kwargs["timeout"] = 15000
 
-        # Login verification if credentials provided
-        acc = mt5.account_info()
-        if acc is None or (self.account and acc.login != self.account):
-            if self.account and self.password and self.server:
-                login_ok = mt5.login(
-                    login=self.account,
-                    password=self.password,
-                    server=self.server
-                )
-                if not login_ok:
-                    err = mt5.last_error()
-                    logger.error(f"MT5 login failed for account {self.account} on {self.server}: {err}")
-                    return False
+            # Khởi tạo MT5 với chứng chỉ cứng (Hard-auth) để ép đăng nhập lại
+            init_result = mt5.initialize(**init_kwargs)
+
+            if not init_result:
+                err = mt5.last_error()
+                logger.error(f"[BRIDGE] Initialize failed: {err}. Terminal might be corrupt or missing.")
+                self.kill_zombie_terminal()
+                continue
+
+            # Kiểm tra trạng thái kết nối thực sự tới Server
+            terminal_info = mt5.terminal_info()
+            if terminal_info is None or not terminal_info.connected:
+                logger.warning("[BRIDGE] Terminal running but DISCONNECTED from broker (Holiday/Weekend effect).")
+                try:
+                    mt5.shutdown()
+                except Exception:
+                    pass
+                self.kill_zombie_terminal()
+                continue
+
+            # Kiểm tra xem tài khoản có bị Read-only/Invalid password không
+            if not terminal_info.trade_allowed:
+                logger.warning("[BRIDGE] WARNING: Terminal connected but Trading is Disabled (Check Investor password / Algo trading).")
+
+            # Đảm bảo account_info khớp với tài khoản yêu cầu
             acc = mt5.account_info()
+            if acc is None or (self.account and acc.login != int(self.account)):
+                if self.account and self.password and self.server:
+                    login_ok = mt5.login(
+                        login=int(self.account),
+                        password=self.password,
+                        server=self.server
+                    )
+                    if not login_ok:
+                        err = mt5.last_error()
+                        logger.error(f"[BRIDGE] MT5 login failed for account {self.account} on {self.server}: {err}")
+                        self.kill_zombie_terminal()
+                        continue
+                acc = mt5.account_info()
 
-        if acc is None:
-            logger.error("Failed to retrieve MT5 account info.")
-            return False
+            if acc is None:
+                logger.error("[BRIDGE] Failed to retrieve MT5 account info after login.")
+                self.kill_zombie_terminal()
+                continue
 
-        is_real = (acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_REAL)
-        mode_str = "🔴 REAL MONEY (Tiền Thật)" if is_real else "🟡 DEMO / TRIAL"
+            ping_val = getattr(terminal_info, "ping_last", 0)
+            is_real = (acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_REAL)
+            mode_str = "🔴 REAL MONEY (Tiền Thật)" if is_real else "🟡 DEMO / TRIAL"
 
-        logger.info(
-            f"✅ MT5 Gateway Connected successfully! "
-            f"Account: {acc.login} | Server: {acc.server} | Mode: {mode_str} | "
-            f"Balance: ${acc.balance:,.2f} | Equity: ${acc.equity:,.2f} | Leverage: 1:{acc.leverage}"
-        )
-        self.connected = True
-        return True
+            logger.info(
+                f"✅ [BRIDGE] Successfully connected to {self.server} | Ping: {ping_val} ms | "
+                f"Account: #{acc.login} | Mode: {mode_str} | "
+                f"Balance: ${acc.balance:,.2f} | Equity: ${acc.equity:,.2f} | Leverage: 1:{acc.leverage}"
+            )
+            self.connected = True
+            return True
+
+        logger.critical("[CRITICAL] Failed to connect to MT5 after multiple hard-resets.")
+        self.connected = False
+        return False
+
+    def initialize(self) -> bool:
+        """Connects to MT5 terminal and verifies account authentication (via connect_robust)."""
+        return self.connect_robust(max_retries=3)
+
+    def ensure_symbols_visible(self, symbols_list: List[str]) -> None:
+        """Buộc MT5 hiển thị lại các cặp tài sản trong Market Watch (tránh bị ẩn sau bảo trì Exness)."""
+        if not self.ensure_connected() or not MT5_AVAILABLE:
+            return
+        for sym in symbols_list:
+            resolved = self.resolve_symbol(sym)
+            if not mt5.symbol_select(resolved, True):
+                err = mt5.last_error()
+                logger.warning(f"[BRIDGE] Failed to add {resolved} (requested {sym}) to Market Watch: {err}")
+            else:
+                logger.debug(f"[BRIDGE] Symbol {resolved} selected and visible in Market Watch.")
+
+    def cancel_all_pending_orders(self, magic: Optional[int] = None, symbol: Optional[str] = None) -> int:
+        """Hủy các lệnh Pending chưa khớp khi shutdown bot để tránh kẹt lệnh."""
+        if not self.ensure_connected() or not MT5_AVAILABLE:
+            return 0
+
+        orders = mt5.orders_get()
+        if orders is None or len(orders) == 0:
+            return 0
+
+        cancelled_count = 0
+        for o in orders:
+            if magic is not None and o.magic != magic:
+                continue
+            if symbol is not None and o.symbol != symbol:
+                continue
+
+            req = {
+                "action": mt5.TRADE_ACTION_REMOVE,
+                "order": o.ticket,
+            }
+            res = mt5.order_send(req)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info(f"🚫 [CANCELLED PENDING] Order #{o.ticket} {o.symbol} cancelled successfully.")
+                cancelled_count += 1
+            else:
+                comment = res.comment if res else str(mt5.last_error())
+                logger.warning(f"⚠️ Failed to cancel pending order #{o.ticket}: {comment}")
+
+        return cancelled_count
 
     def get_account_info(self) -> Dict[str, Any]:
         """Returns normalized account status dictionary."""
@@ -150,9 +241,9 @@ class MT5Bridge:
 
         term = mt5.terminal_info()
         if term is None or not term.connected:
-            logger.warning("[MT5] Heartbeat disconnected. Attempting auto-reconnect...")
+            logger.warning("[MT5] Heartbeat disconnected (Holiday/Maintenance/Zombie). Invoking robust reconnection...")
             self.connected = False
-            return self.initialize()
+            return self.connect_robust(max_retries=2)
 
         self.connected = True
         return True
@@ -242,6 +333,10 @@ class MT5Bridge:
             return mt5.ORDER_FILLING_FOK
         return mt5.ORDER_FILLING_RETURN
 
+    def get_last_execution_metrics(self) -> Optional[Dict[str, Any]]:
+        """Returns the execution telemetry (latency, slippage) from the most recent order."""
+        return self.last_execution_metrics
+
     def send_order(
         self,
         symbol: str,
@@ -251,10 +346,12 @@ class MT5Bridge:
         tp_price: float = 0.0,
         magic: int = 777001,
         comment: str = "HFT_ML4T",
-        slippage_points: int = 20
+        slippage_points: int = 20,
+        expected_price: Optional[float] = None
     ) -> Tuple[bool, str, Optional[int]]:
         """
-        Executes a live market order with slippage limits and ticket tracking.
+        Executes a live market order with microsecond timestamp telemetry,
+        precise slippage auditing, and ticket tracking.
         Returns (success: bool, message: str, ticket: Optional[int]).
         """
         if not self.ensure_connected():
@@ -274,7 +371,8 @@ class MT5Bridge:
         # Price setup
         is_buy = (order_type.upper() == "BUY")
         action_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
-        price = tick.ask if is_buy else tick.bid
+        market_quote_price = tick.ask if is_buy else tick.bid
+        ref_expected_price = expected_price if (expected_price is not None and expected_price > 0) else market_quote_price
 
         # Round lot to broker steps
         lot_step = info.volume_step or 0.01
@@ -288,7 +386,7 @@ class MT5Bridge:
             "symbol": symbol,
             "volume": float(lot_clean),
             "type": action_type,
-            "price": float(round(price, info.digits)),
+            "price": float(round(market_quote_price, info.digits)),
             "sl": float(round(sl_price, info.digits)) if sl_price > 0 else 0.0,
             "tp": float(round(tp_price, info.digits)) if tp_price > 0 else 0.0,
             "deviation": int(slippage_points),
@@ -297,6 +395,10 @@ class MT5Bridge:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": optimal_fill,
         }
+
+        # Timestamp at dispatch (precision: microsecond)
+        t_dispatch = time.perf_counter()
+        t_dispatch_utc = datetime.now(timezone.utc)
 
         # Try optimal filling mode with dynamic fallback ladder
         result = mt5.order_send(request)
@@ -308,6 +410,10 @@ class MT5Bridge:
                     if result and result.retcode != mt5.TRADE_RETCODE_INVALID_FILL:
                         break
 
+        # Timestamp at response arrival
+        t_fill = time.perf_counter()
+        latency_ms = (t_fill - t_dispatch) * 1000.0
+
         if result is None:
             err = mt5.last_error()
             return False, f"order_send failed: {err}", None
@@ -315,8 +421,44 @@ class MT5Bridge:
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             return False, f"Broker returned code {result.retcode}: {result.comment}", None
 
+        # Actual execution price confirmed by Exness / Broker
+        fill_price = float(result.price) if getattr(result, "price", 0) > 0 else market_quote_price
+        point = info.point if (info and info.point > 0) else 0.00001
+        contract_size = getattr(info, "trade_contract_size", 1.0) or 1.0
+
+        # Directional Slippage:
+        # Positive = adverse slippage (bought higher than expected or sold lower than expected)
+        # Negative = favorable price improvement
+        if is_buy:
+            slippage_pts = (fill_price - ref_expected_price) / point
+            slippage_usd = (fill_price - ref_expected_price) * lot_clean * contract_size
+        else:
+            slippage_pts = (ref_expected_price - fill_price) / point
+            slippage_usd = (ref_expected_price - fill_price) * lot_clean * contract_size
+
+        # Record execution metrics
+        exec_record = {
+            "timestamp_utc": t_dispatch_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "ticket": result.order,
+            "symbol": symbol,
+            "order_type": order_type.upper(),
+            "volume": lot_clean,
+            "expected_price": round(ref_expected_price, info.digits),
+            "fill_price": round(fill_price, info.digits),
+            "slippage_points": round(slippage_pts, 2),
+            "slippage_usd": round(slippage_usd, 2),
+            "latency_ms": round(latency_ms, 2),
+            "retcode": result.retcode,
+            "comment": comment[:31]
+        }
+        self.last_execution_metrics = exec_record
+
+        # Append to execution_audit.csv
+        log_execution_audit(self.log_dir, exec_record)
+
         logger.info(
-            f"🎯 [ORDER FILLED] Ticket #{result.order} | {order_type} {lot_clean} {symbol} @ {price:.5f} | "
+            f"🎯 [ORDER FILLED] Ticket #{result.order} | {order_type} {lot_clean} {symbol} @ {fill_price:.5f} | "
+            f"Latency: {latency_ms:.1f}ms | Slippage: {slippage_pts:+.1f} pts (${slippage_usd:+.2f}) | "
             f"SL: {sl_price:.5f} | TP: {tp_price:.5f} | Magic: {magic}"
         )
         return True, "SUCCESS", result.order

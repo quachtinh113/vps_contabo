@@ -17,29 +17,101 @@ class CUSUMEventFilter:
     """
     Symmetric CUSUM Filter: detects structural shifts in price when cumulative
     deviations exceed an adaptive volatility threshold.
+    Enforces closed-bar timestamp deduplication (Zero Look-Ahead & Intra-Bar State Protection).
     """
 
-    def __init__(self, threshold_multiplier: float = 1.5):
-        self.threshold_multiplier = threshold_multiplier
+    def __init__(self, threshold_multiplier: float = 1.5, threshold_mult: Optional[float] = None):
+        self.threshold_multiplier = threshold_mult if threshold_mult is not None else threshold_multiplier
+        self.threshold_mult = self.threshold_multiplier
         self.s_pos = 0.0
         self.s_neg = 0.0
+        self.s_pos_map: Dict[str, float] = {}
+        self.s_neg_map: Dict[str, float] = {}
+        self.last_bar_time: Dict[str, int] = {}
+        self.active_event_dir: Dict[str, int] = {}
 
-    def update(self, price_return: float, volatility: float) -> Tuple[bool, int]:
+    def update_on_closed_bar(self, sym: str, closed_df: pd.DataFrame) -> int:
+        """
+        Updates CUSUM state strictly once per newly closed M15 bar.
+        Prevents 450x intra-bar return accumulation across 2-second polling ticks.
+        """
+        if closed_df is None or len(closed_df) < 2:
+            return 0
+
+        raw_t = closed_df["time"].iloc[-1] if "time" in closed_df.columns else len(closed_df)
+        if isinstance(raw_t, pd.Timestamp):
+            bar_ts = int(raw_t.timestamp())
+        elif hasattr(raw_t, "timestamp"):
+            bar_ts = int(raw_t.timestamp())
+        else:
+            bar_ts = int(raw_t)
+
+        # Chốt chặn trùng lặp: Nếu nến này đã được tính rồi thì trả về trạng thái hiện hữu (0 để tránh phát tín hiệu trùng)
+        if self.last_bar_time.get(sym) == bar_ts:
+            return self.active_event_dir.get(sym, 0)
+
+        self.last_bar_time[sym] = bar_ts
+        log_ret = float(np.log(closed_df["close"].iloc[-1] / closed_df["close"].iloc[-2]))
+        sigma_series = np.log(closed_df["close"] / closed_df["close"].shift(1)).rolling(min(20, len(closed_df) - 1)).std()
+        sigma = float(sigma_series.iloc[-1]) if not np.isnan(sigma_series.iloc[-1]) else 0.005
+        h = max(sigma * self.threshold_mult, 0.0005)
+
+        s_p = max(0.0, self.s_pos_map.get(sym, 0.0) + log_ret)
+        s_n = min(0.0, self.s_neg_map.get(sym, 0.0) + log_ret)
+
+        if s_p > h:
+            self.s_pos_map[sym] = 0.0
+            self.s_neg_map[sym] = s_n
+            self.active_event_dir[sym] = 1
+        elif s_n < -h:
+            self.s_neg_map[sym] = 0.0
+            self.s_pos_map[sym] = s_p
+            self.active_event_dir[sym] = -1
+        else:
+            self.s_pos_map[sym] = s_p
+            self.s_neg_map[sym] = s_n
+            self.active_event_dir[sym] = 0
+
+        return self.active_event_dir[sym]
+
+    def update(
+        self,
+        price_return: float,
+        volatility: float,
+        bar_time: Optional[Any] = None,
+        sym: str = "DEFAULT"
+    ) -> Tuple[bool, int]:
         """
         Updates CUSUM state with incoming log return.
+        If bar_time is provided, enforces strict closed-bar timestamp deduplication.
         Returns (is_event: bool, direction: int) where direction in {-1, 0, 1}.
         """
+        if bar_time is not None:
+            if isinstance(bar_time, pd.Timestamp):
+                bar_ts = int(bar_time.timestamp())
+            elif hasattr(bar_time, "timestamp"):
+                bar_ts = int(bar_time.timestamp())
+            else:
+                bar_ts = int(bar_time)
+
+            if self.last_bar_time.get(sym) == bar_ts:
+                return False, 0
+            self.last_bar_time[sym] = bar_ts
+
         threshold = max(0.0005, volatility * self.threshold_multiplier)
         self.s_pos = max(0.0, self.s_pos + price_return)
         self.s_neg = min(0.0, self.s_neg + price_return)
 
         if self.s_pos > threshold:
             self.s_pos = 0.0
+            self.active_event_dir[sym] = 1
             return True, 1  # Bullish impulse event
         elif self.s_neg < -threshold:
             self.s_neg = 0.0
+            self.active_event_dir[sym] = -1
             return True, -1  # Bearish impulse event
 
+        self.active_event_dir[sym] = 0
         return False, 0
 
 

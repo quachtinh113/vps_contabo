@@ -30,9 +30,12 @@ class FXMicroArbitrageStrategy:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.symbol = config.get("symbol", "GBPUSDm")
+        self.symbol = config.get("name", config.get("symbol", "GBPUSDm"))
         self.magic = config.get("magic", 777002)
         self.max_spread_points = config.get("max_spread_points", 20.0)  # ~2.0 pips
+        self.sl_multiplier = config.get("sl_multiplier", 2.0)
+        self.tp_multiplier = config.get("tp_multiplier", 3.0)
+        self.digits = config.get("digits", 5)
 
         as_cfg = config.get("avellaneda_stoikov", {})
         self.as_engine = AvellanedaStoikovEngine(
@@ -44,9 +47,39 @@ class FXMicroArbitrageStrategy:
         
         sizing_cfg = config.get("position_sizing", {})
         self.position_sizer = PositionSizer(
-            risk_per_trade_pct=sizing_cfg.get("risk_per_trade_pct", 0.005),
-            max_lot_cap=sizing_cfg.get("max_lot_cap", 0.5)
+            risk_per_trade_pct=sizing_cfg.get("risk_per_trade_pct", 0.002),
+            max_lot_cap=sizing_cfg.get("max_lot_cap", 0.05)
         )
+
+    def calculate_triple_barriers(self, entry_price: float, side: int, closed_rates_df: pd.DataFrame) -> tuple[float, float]:
+        """
+        Tính SL/TP dựa trên ATR(14) của chuỗi nến M15 ĐÃ ĐÓNG (iloc[:-1]),
+        loại bỏ hiện tượng SL siêu hẹp từ Garman-Klass 1 nến.
+        """
+        high = closed_rates_df["high"]
+        low = closed_rates_df["low"]
+        prev_close = closed_rates_df["close"].shift(1)
+
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+
+        atr_14 = float(tr.rolling(window=14).mean().iloc[-1])
+        if np.isnan(atr_14) or atr_14 <= 0:
+            atr_14 = entry_price * 0.0010
+
+        min_atr_floor = entry_price * self.config.get("min_sl_distance_pct", 0.0008)
+        effective_atr = max(atr_14, min_atr_floor)
+
+        sl_dist = effective_atr * self.sl_multiplier
+        tp_dist = effective_atr * self.tp_multiplier
+
+        if side == 1:  # BUY
+            return round(entry_price - sl_dist, self.digits), round(entry_price + tp_dist, self.digits)
+        else:          # SELL
+            return round(entry_price + sl_dist, self.digits), round(entry_price - tp_dist, self.digits)
 
     def evaluate(
         self,
@@ -59,9 +92,15 @@ class FXMicroArbitrageStrategy:
         lot_step: float = 0.01,
         risk_multiplier: float = 1.0,
         h1_df: Optional[pd.DataFrame] = None,
-        ema200_h1: Optional[float] = None
+        ema200_h1: Optional[float] = None,
+        closed_rates_df: Optional[pd.DataFrame] = None,
+        closed_h1_df: Optional[pd.DataFrame] = None,
+        now_utc: Optional[Any] = None,
+        is_new_bar: Optional[bool] = None
     ) -> Optional[Dict[str, Any]]:
-        if rates_df is None or len(rates_df) < 25:
+        df_m15 = closed_rates_df if closed_rates_df is not None else rates_df
+        df_h1 = closed_h1_df if closed_h1_df is not None else h1_df
+        if df_m15 is None or len(df_m15) < 25:
             return None
 
         mid_price = market_snapshot.get("mid", 0.0)
@@ -69,11 +108,11 @@ class FXMicroArbitrageStrategy:
         if mid_price <= 0 or spread_pts > self.max_spread_points:
             return None
 
-        # 1. Volatility
-        volatility = calculate_garman_klass_volatility(rates_df, window=20)
+        # 1. Volatility on closed bars
+        volatility = calculate_garman_klass_volatility(df_m15, window=20)
 
         # 2. Institutional Order Flow Imbalance (OFI) proxy (ML4T Ch. 21)
-        ofi = calculate_order_flow_imbalance(rates_df, window=5)
+        ofi = calculate_order_flow_imbalance(df_m15, window=5)
 
         # 3. Avellaneda-Stoikov Quotes
         quotes = self.as_engine.calculate_quotes(
@@ -109,7 +148,7 @@ class FXMicroArbitrageStrategy:
             return None
 
         # 4. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
-        macro_info = calculate_macro_regime_slope(rates_df, h1_df)
+        macro_info = calculate_macro_regime_slope(df_m15, df_h1)
         if macro_info.get("regime") != "UNKNOWN":
             if action == "BUY":
                 if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
@@ -119,23 +158,23 @@ class FXMicroArbitrageStrategy:
                 if macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03:
                     logger.debug(f"[{self.symbol}] VETO SELL: H1 Macro Regime is Bullish or Slope > 0")
                     return None
-        elif ema200_val is not None:
-            if action == "BUY" and mid_price < ema200_val:
-                logger.debug(f"[{self.symbol}] VETO BUY: Price {mid_price} < H1 EMA200 {ema200_val:.5f} (Bearish Macro Regime)")
+        elif ema200_h1 is not None:
+            if action == "BUY" and mid_price < ema200_h1:
+                logger.debug(f"[{self.symbol}] VETO BUY: Price {mid_price} < H1 EMA200 {ema200_h1:.5f} (Bearish Macro Regime)")
                 return None
-            elif action == "SELL" and mid_price > ema200_val:
-                logger.debug(f"[{self.symbol}] VETO SELL: Price {mid_price} > H1 EMA200 {ema200_val:.5f} (Bullish Macro Regime)")
+            elif action == "SELL" and mid_price > ema200_h1:
+                logger.debug(f"[{self.symbol}] VETO SELL: Price {mid_price} > H1 EMA200 {ema200_h1:.5f} (Bullish Macro Regime)")
                 return None
 
         # 5. ML Gatekeeper & Intraday Momentum Alignment
-        sma20 = rates_df["close"].rolling(20).mean().iloc[-1]
+        sma20 = df_m15["close"].rolling(20).mean().iloc[-1]
         trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         
         # Strictly reject counter-trend entries in high-frequency FX
         if trend_align < 0:
             return None
             
-        hist_vols = [calculate_garman_klass_volatility(rates_df.iloc[:i], window=20) for i in range(25, len(rates_df), 5)]
+        hist_vols = [calculate_garman_klass_volatility(df_m15.iloc[:i], window=20) for i in range(25, len(df_m15), 5)]
         median_vol = float(np.median(hist_vols)) if hist_vols else volatility
         vol_ratio = (volatility / median_vol) if median_vol > 0 else 1.0
 
@@ -147,13 +186,12 @@ class FXMicroArbitrageStrategy:
         if not approved:
             return None
 
-        # 5. Barriers & Sizing
-        sl_price, tp_price = calculate_triple_barriers(
+        # 5. Barriers & Sizing using Closed-Bar ATR(14)
+        side_int = 1 if action == "BUY" else -1
+        sl_price, tp_price = self.calculate_triple_barriers(
             entry_price=mid_price,
-            volatility=volatility,
-            action=action,
-            sl_multiplier=self.config.get("sl_multiplier", 1.5),
-            tp_multiplier=self.config.get("tp_multiplier", 2.0)
+            side=side_int,
+            closed_rates_df=df_m15
         )
 
         lot, size_reason = self.position_sizer.calculate_lot(
