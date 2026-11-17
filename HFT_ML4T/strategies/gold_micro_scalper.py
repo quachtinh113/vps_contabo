@@ -121,31 +121,79 @@ class GoldMicroScalperStrategy:
         bar_t = df_m15["time"].iloc[-1] if "time" in df_m15.columns else None
         is_event, direction = self.cusum_filter.update(ret, volatility, bar_time=bar_t, sym=self.symbol)
 
-        # Signal Generation Logic:
-        action = None
-        if skew_offset > (volatility * mid_price * 0.15) and ofi > 0.20:
-            action = "BUY"
-        elif skew_offset < -(volatility * mid_price * 0.15) and ofi < -0.20:
-            action = "SELL"
-        elif is_event and (direction * ofi > 0) and abs(ofi) >= 0.15:
-            action = "BUY" if direction > 0 else "SELL"
+        # 4. Asian Range Extraction (00:00 - 07:00 UTC)
+        times = df_m15["time"] if "time" in df_m15.columns else df_m15.index
+        if pd.api.types.is_numeric_dtype(times):
+            bar_dts = pd.to_datetime(times, unit="s", utc=True)
+        else:
+            bar_dts = pd.to_datetime(times, utc=True)
 
-        # 4.1 Anti-Climax Gate: Block chasing extreme exhaustion climaxes (Adverse Selection protection)
-        if action == "SELL" and ofi < -0.70:
+        cur_date = cur_dt.date()
+        asian_mask = (bar_dts.dt.date == cur_date) & (bar_dts.dt.hour >= 0) & (bar_dts.dt.hour < 7)
+        if asian_mask.sum() >= 4:
+            asian_high = float(df_m15.loc[asian_mask, "high"].max())
+            asian_low = float(df_m15.loc[asian_mask, "low"].min())
+        else:
+            hist_asian = df_m15[bar_dts.dt.hour < 7]
+            asian_high = float(hist_asian["high"].iloc[-28:].max()) if len(hist_asian) >= 4 else float(df_m15["high"].iloc[-28:].max())
+            asian_low = float(hist_asian["low"].iloc[-28:].min()) if len(hist_asian) >= 4 else float(df_m15["low"].iloc[-28:].min())
+
+        # 4.1 Sweep & Rejection Forensics on the Latest Closed Bar (iloc[-1])
+        last_bar = df_m15.iloc[-1]
+        bar_o = float(last_bar["open"])
+        bar_h = float(last_bar["high"])
+        bar_l = float(last_bar["low"])
+        bar_c = float(last_bar["close"])
+        body = abs(bar_c - bar_o)
+        upper_wick = bar_h - max(bar_o, bar_c)
+        lower_wick = min(bar_o, bar_c) - bar_l
+        wick_ratio = 1.5
+
+        # Bearish Sweep: High swept Asian High, Closed back below, Rejection Wick >= 1.5x Body, OBI <= -0.70
+        is_bear_sweep = (bar_h > asian_high) and (bar_c < asian_high) and (upper_wick >= wick_ratio * max(body, 0.50)) and (ofi <= -0.70)
+
+        # Bullish Sweep: Low swept Asian Low, Closed back above, Rejection Wick >= 1.5x Body, OBI >= +0.70
+        is_bull_sweep = (bar_l < asian_low) and (bar_c > asian_low) and (lower_wick >= wick_ratio * max(body, 0.50)) and (ofi >= 0.70)
+
+        action = None
+        if is_bear_sweep:
+            action = "SELL"
             logger.info(
-                f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: SELLING_CLIMAX_EXHAUSTION "
-                f"(SELL rejected: OFI {ofi:.3f} < -0.70 indicates extreme seller exhaustion / liquidity sweep)"
+                f"🎯 [SWEEP_REJECTION] {self.symbol} - Bearish Asian High Sweep Triggered! "
+                f"High: {bar_h:.2f} > AsianHigh: {asian_high:.2f} | Wick: {upper_wick:.2f} vs Body: {body:.2f} | OFI: {ofi:.3f} <= -0.70"
             )
-            return None
-        elif action == "BUY" and ofi > 0.85:
+        elif is_bull_sweep:
+            action = "BUY"
             logger.info(
-                f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: BUYING_CLIMAX_EXHAUSTION "
-                f"(BUY rejected: OFI {ofi:.3f} > 0.85 indicates extreme buyer exhaustion)"
+                f"🎯 [SWEEP_REJECTION] {self.symbol} - Bullish Asian Low Sweep Triggered! "
+                f"Low: {bar_l:.2f} < AsianLow: {asian_low:.2f} | Wick: {lower_wick:.2f} vs Body: {body:.2f} | OFI: {ofi:.3f} >= +0.70"
             )
-            return None
+        elif abs(ofi) >= 0.70 and is_event and (direction * ofi > 0):
+            # Secondary CUSUM Imbalance Reversal Trap (Pure microstructure exhaustion, no lagging MA)
+            if direction < 0 and upper_wick >= wick_ratio * max(body, 0.50):
+                action = "SELL"
+            elif direction > 0 and lower_wick >= wick_ratio * max(body, 0.50):
+                action = "BUY"
 
         if not action:
             return None
+
+        # 4.2 Fat-Tail Conviction Regime Detection
+        # Extreme OBI (>= 0.85) + Volume Surge (>= 3x SMA20) during Peak US Session (13:00 - 17:00 UTC)
+        cur_hour = cur_dt.hour
+        is_peak_us = (13 <= cur_hour < 17)
+        curr_vol = float(last_bar["tick_volume"]) if "tick_volume" in last_bar else 1.0
+        vol_sma20 = float(df_m15["tick_volume"].iloc[-21:-1].mean()) if "tick_volume" in df_m15.columns and len(df_m15) >= 21 else 1.0
+        vol_mult = (curr_vol / vol_sma20) if vol_sma20 > 0 else 1.0
+
+        if is_peak_us and abs(ofi) >= 0.85 and vol_mult >= 3.0:
+            regime = "FAT_TAIL"
+            logger.info(
+                f"🔥 [FAT-TAIL CONVICTION] {self.symbol} - Extreme Inflow Detected! "
+                f"OFI: {ofi:.3f} (>= 0.85) | Vol: {vol_mult:.2f}x SMA20 (>= 3.0x) | Peak US Session ({cur_dt.strftime('%H:%M')} UTC)"
+            )
+        else:
+            regime = "BASELINE"
 
         # 4.5 Hard Inventory Quoting Circuit Breaker
         if action == "BUY" and not quotes.get("allow_bid", True):
@@ -159,43 +207,27 @@ class GoldMicroScalperStrategy:
             )
             return None
 
-        # 5. Institutional Multi-Horizon Macro Regime & Velocity Gating (RenTech / Millennium)
-        macro_info = calculate_macro_regime_slope(df_m15, df_h1)
-        if macro_info.get("regime") != "UNKNOWN":
-            if action == "BUY":
-                if macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03:
-                    logger.info(
-                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
-                        f"(BUY rejected: H1 Bearish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
-                    )
+        # 5. Macro Regime Check (Non-lagging, pure H1 multi-horizon slope)
+        # Note: Asian Range Sweeps are exhaustion mean-reversion traps hunting retail stops;
+        # they must not be vetoed by short-term slope pointing into the swept boundary.
+        is_pure_sweep = is_bear_sweep or is_bull_sweep
+        if not is_pure_sweep:
+            macro_info = calculate_macro_regime_slope(df_m15, df_h1)
+            if macro_info.get("regime") != "UNKNOWN":
+                if action == "BUY" and (macro_info.get("is_bear_aligned") or macro_info.get("slope_ema21_pct", 0.0) < -0.03):
+                    logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected: H1 Bearish slope)")
                     return None
-            elif action == "SELL":
-                if macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03:
-                    logger.info(
-                        f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH "
-                        f"(SELL rejected: H1 Bullish slope {macro_info.get('slope_ema21_pct', 0):.3f}%)"
-                    )
+                elif action == "SELL" and (macro_info.get("is_bull_aligned") or macro_info.get("slope_ema21_pct", 0.0) > 0.03):
+                    logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected: H1 Bullish slope)")
                     return None
-        elif ema200_h1 is not None:
-            if action == "BUY" and mid_price < ema200_h1:
-                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected below H1 EMA200)")
-                return None
-            elif action == "SELL" and mid_price > ema200_h1:
-                logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected above H1 EMA200)")
-                return None
-
-        # 5.5 M15 Price Action Alignment (Never catch falling knives under M15 EMA20)
-        ema20_m15 = float(df_m15["close"].ewm(span=20, adjust=False).mean().iloc[-1])
-        if action == "BUY" and mid_price < ema20_m15 * 0.999:
-            logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (BUY rejected: Price below M15 EMA20)")
-            return None
-        elif action == "SELL" and mid_price > ema20_m15 * 1.001:
-            logger.info(f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: H1_TREND_MISMATCH (SELL rejected: Price above M15 EMA20)")
-            return None
 
         # 6. ML Meta Gatekeeper Check
-        sma20 = df_m15["close"].rolling(20).mean().iloc[-1]
-        trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
+        # For liquidity sweep traps, trend_alignment evaluates alignment between trade action and exhaustion OFI
+        if is_pure_sweep:
+            trend_align = 1.0 if (action == "BUY" and ofi > 0) or (action == "SELL" and ofi < 0) else -1.0
+        else:
+            sma20 = df_m15["close"].rolling(20).mean().iloc[-1]
+            trend_align = 1.0 if (mid_price > sma20 and action == "BUY") or (mid_price < sma20 and action == "SELL") else -1.0
         
         hist_vols = [calculate_garman_klass_volatility(df_m15.iloc[:i], window=20) for i in range(25, len(df_m15), 5)]
         median_vol = float(np.median(hist_vols)) if hist_vols else volatility
@@ -298,5 +330,6 @@ class GoldMicroScalperStrategy:
             "reservation_price": reservation_price,
             "risk_score": risk_score,
             "macro_regime": macro_info.get("regime", "UNKNOWN") if "macro_info" in locals() else "UNKNOWN",
-            "slope_ema21_pct": float(macro_info.get("slope_ema21_pct", 0.0)) if "macro_info" in locals() else 0.0
+            "slope_ema21_pct": float(macro_info.get("slope_ema21_pct", 0.0)) if "macro_info" in locals() else 0.0,
+            "regime": regime if "regime" in locals() else "BASELINE"
         }
