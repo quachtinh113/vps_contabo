@@ -131,7 +131,9 @@ symbols:
     trading_session_utc: ["07:00", "21:00"] # Phiên Âu - Mỹ (07:00 - 21:00 UTC)
     asian_range_window_utc: ["00:00", "07:00"] # Khung quét biên Á để săn thanh khoản
     sl_multiplier: 1.5
-    tp_multiplier: 3.5             # Nâng R:R lên 1:2.33 để tối ưu hóa kỳ vọng
+    baseline_tp_multiplier: 2.0    # 2.0x ATR14 for standard mean-reversion sweeps (Triples Expectancy, MaxDD -$68.55)
+    fat_tail_tp_multiplier: 3.5    # 3.5x ATR14 for Fat-Tail Conviction Mode during US Peak (13:00-17:00 UTC)
+    tp_multiplier: 2.0             # Default to baseline 2.0x
     position_sizing:
       risk_per_trade_pct: 0.005    # Capped at exactly 0.5% Institutional Risk Per Trade
       max_lot_cap: 0.07            # Capped at 0.07 lot for baseline trades

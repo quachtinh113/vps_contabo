@@ -54,6 +54,8 @@ class GoldMicroScalperStrategy:
         self.asia_europe_sl_mult = self.session_aware_cfg.get("asia_europe_sl_mult", 1.5)
         self.us_session_sl_mult = self.session_aware_cfg.get("us_session_sl_mult", 2.2)
         self.tp_rr_ratio = self.session_aware_cfg.get("tp_rr_ratio", 2.0)
+        self.baseline_tp_mult = float(config.get("baseline_tp_multiplier", config.get("tp_multiplier", 2.0)))
+        self.fat_tail_tp_mult = float(config.get("fat_tail_tp_multiplier", 3.5))
 
         sizing_cfg = config.get("position_sizing", {})
         self.position_sizer = PositionSizer(
@@ -286,8 +288,18 @@ class GoldMicroScalperStrategy:
         if np.isnan(atr14) or atr14 <= 0:
             atr14 = volatility * mid_price
 
+        # Regime-Adaptive TP Multiplier:
+        # Standard BASELINE mean-reversion sweeps target 2.0x ATR (Asian mid-range reversion).
+        # FAT_TAIL conviction trends during US Peak (13-17 UTC) target 3.5x ATR for asymmetric upside.
+        if regime == "FAT_TAIL":
+            tp_multiplier = self.fat_tail_tp_mult
+            tp_tag = f"FAT_TAIL ({tp_multiplier:.1f}x ATR)"
+        else:
+            tp_multiplier = self.baseline_tp_mult
+            tp_tag = f"BASELINE ({tp_multiplier:.1f}x ATR)"
+
         sl_dist = sl_multiplier * atr14
-        tp_dist = sl_dist * self.tp_rr_ratio
+        tp_dist = tp_multiplier * atr14
 
         if action == "BUY":
             sl_price = round(mid_price - sl_dist, 3)
@@ -311,8 +323,8 @@ class GoldMicroScalperStrategy:
             return None
 
         logger.info(
-            f"🏛️ [GOLD_SESSION_ATR] {session_tag} -> SL Mult: {sl_multiplier}x ATR14 (${atr14:.2f}) | "
-            f"Dist: ${sl_dist:.2f} | Lot: {lot} | Risk Invariant: ${lot * sl_dist * contract_size:.2f} "
+            f"🏛️ [GOLD_SESSION_ATR] {session_tag} | Regime: {tp_tag} -> SL Mult: {sl_multiplier}x ATR14 (${atr14:.2f}) | "
+            f"SL Dist: ${sl_dist:.2f} | TP Dist: ${tp_dist:.2f} | Lot: {lot} | Risk Invariant: ${lot * sl_dist * contract_size:.2f} "
             f"(Budget: ${account_equity * self.position_sizer.risk_per_trade_pct * risk_multiplier:.2f})"
         )
 

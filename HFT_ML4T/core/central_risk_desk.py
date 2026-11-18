@@ -102,6 +102,7 @@ class CentralRiskDesk:
         self._consecutive_losses: Dict[str, int] = {}
         self._daily_symbol_pnl: Dict[str, float] = {}
         self._asia_realized_pnl = 0.0
+        self._peak_daily_realized_pnl = 0.0
         self._symbol_locked_for_day: Dict[str, bool] = {}
         self._symbol_recovery_trades: Dict[str, int] = {}
         self._execution_history: Dict[str, list] = {}
@@ -187,6 +188,7 @@ class CentralRiskDesk:
             self._consecutive_losses.clear()
             self._daily_symbol_pnl.clear()
             self._asia_realized_pnl = 0.0
+            self._peak_daily_realized_pnl = 0.0
             self._symbol_locked_for_day.clear()
             self._symbol_cooldowns.clear()
             logger.info(
@@ -223,6 +225,27 @@ class CentralRiskDesk:
         if session == "ASIA" and "XAU" in symbol.upper():
             return 0.50  # 0.25% risk per trade in Asia
         return 1.0
+
+    def get_dynamic_daily_floor(self, now_utc: Optional[datetime] = None) -> float:
+        """
+        Calculates the Inter-Session One-Way Profit Ratchet (Dynamic Daily Floor).
+        - Rule 1 (London Banked Gains Protection): If peak realized PnL reaches >= 50% of today's target
+          (e.g., >= +$100 on a $200 day, or +$110 London quota), ratchets floor to at least 50% of peak gains
+          (min $50.00), preventing the US session from wiping out morning alpha.
+        - Rule 2 (Fat-Tail Runner Ratchet): If peak realized PnL exceeds today's target (e.g., >= +$200),
+          ratchets floor to 75% of target (e.g., +$150.00), locking baseline while hunting upside.
+        """
+        today_target = self.get_today_target(now_utc)
+        peak = self._peak_daily_realized_pnl
+
+        if peak >= today_target:
+            # Rule 2: Lock at least 75% of baseline weekday target
+            return today_target * 0.75
+        elif peak >= (today_target * 0.50):
+            # Rule 1: Lock at least 50% of peak banked gains (minimum $50 floor)
+            return max(peak * 0.50, 50.0)
+
+        return -self.max_daily_drawdown_usd
 
     def check_pre_trade_safety(
         self,
@@ -273,6 +296,16 @@ class CentralRiskDesk:
             london_lock_threshold = today_target * 0.55
             if daily_realized_pnl >= london_lock_threshold:
                 return False, f"London/Asia quota reached (+${daily_realized_pnl:.2f} >= +${london_lock_threshold:.2f}). Paused until US Open (13:00 UTC) to bank morning alpha."
+
+        # 1.25 Inter-Session One-Way Profit Ratchet (Dynamic Daily Floor)
+        dynamic_floor = self.get_dynamic_daily_floor(cur_dt)
+        if self._peak_daily_realized_pnl >= (today_target * 0.50):
+            if daily_realized_pnl <= dynamic_floor:
+                return False, (
+                    f"Inter-Session Profit Ratchet active: Daily Realized PnL (+${daily_realized_pnl:,.2f}) dropped "
+                    f"to/below Dynamic Daily Floor (+${dynamic_floor:,.2f}) from peak (+${self._peak_daily_realized_pnl:,.2f}). "
+                    f"Trading halted for remainder of day to lock in banked morning/session alpha."
+                )
 
         # 1.5 Per-Symbol Isolation Circuit Breaker (Daily loss cap & consecutive losses)
         if self._symbol_locked_for_day.get(symbol, False):
@@ -416,6 +449,11 @@ class CentralRiskDesk:
         cur_dt = datetime.now(timezone.utc)
         if self.get_current_session(cur_dt) == "ASIA":
             self._asia_realized_pnl += profit
+
+        # Update Daily Peak Realized PnL for One-Way Profit Ratchet
+        daily_realized_pnl = sum(self._daily_symbol_pnl.values())
+        if daily_realized_pnl > self._peak_daily_realized_pnl:
+            self._peak_daily_realized_pnl = daily_realized_pnl
 
         if profit >= 0:
             self._consecutive_losses[symbol] = 0
@@ -603,6 +641,8 @@ class CentralRiskDesk:
         self._symbol_cooldowns.clear()
         self._consecutive_losses.clear()
         self._daily_symbol_pnl.clear()
+        self._asia_realized_pnl = 0.0
+        self._peak_daily_realized_pnl = 0.0
         self._symbol_locked_for_day.clear()
         logger.info("[RISK] Central Risk Desk manually unlocked.")
 
