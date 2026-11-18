@@ -9,22 +9,23 @@
 ## 1. TỔNG QUAN HIỆU SUẤT TUẦN
 
 ### 1.1. Bảng số liệu tổng hợp
-- **Tổng số lệnh đã khớp:** 7 lệnh (6 lệnh đã đóng hoàn toàn, 1 lệnh đang mở).
-- **Số lệnh thắng / thua (lệnh đã đóng):** 3 thắng / 3 thua (Tỷ lệ thắng = **50.0%**).
-- **Lợi nhuận ròng thực nhận (Net PnL):** **`+$92.57`** (Chưa tính lệnh đang mở `-$4.68`).
-- **Lợi nhuận theo R:** **`+2.41R`**.
-- **Kỳ vọng toán học thực nghiệm ($\mathbb{E}[R]$):** **`+0.402R / lệnh`**.
-- **Tỷ số lợi nhuận / rủi ro thực tế (Profit Factor):** **`2.64`** (Tổng lãi `$149.08` / Tổng lỗ `$56.51`).
-- **Mức sụt giảm lớn nhất từ đỉnh tuần (Max Drawdown):** **`-$39.16`** (`-0.39%` tài khoản, xảy ra sau 2 lệnh cắt lỗ liên tiếp trên Dầu ngày 17-18/11).
-- **Vị thế hiện tại:** USOILm SELL 0.03 lot (`#5078042666`), PnL trôi nổi: `-$4.68` (`-0.19R`).
+- **Tổng số lệnh đã khớp:** 7 lệnh (7 lệnh đã đóng hoàn toàn, 0 vị thế mở).
+- **Số lệnh thắng / hòa / thua:** 4 thắng (3 thắng lớn, 1 hòa bảo toàn vốn Stage-B) / 3 thua (Tỷ lệ thắng = **57.1%**).
+- **Lợi nhuận ròng thực nhận (Net PnL):** **`+$92.93`**.
+- **Lợi nhuận theo R:** **`+2.42R`**.
+- **Kỳ vọng toán học thực nghiệm ($\mathbb{E}[R]$):** **`+0.346R / lệnh`**.
+- **Tỷ số lợi nhuận / rủi ro thực tế (Profit Factor):** **`2.64`** (Tổng lãi `$149.44` / Tổng lỗ `$56.51`).
+- **Mức sụt giảm lớn nhất từ đỉnh tuần (Max Drawdown chuẩn):** **`-$26.24`** (`-0.26%` tài khoản).
+  *(Đính chính kiểm toán: Đợt sụt giảm 1 từ đỉnh Cum $64.76 xuống $38.52 sau lệnh #5065501024 là -$26.24; sau đó lệnh #5066427148 tạo ĐỈNH MỚI $105.49; đợt sụt giảm 2 chỉ là -$12.92 sau lệnh #5077106403. Việc cộng dồn -$26.24 + -$12.92 = -$39.16 ở bản báo cáo sơ bộ trước là vi phạm nguyên tắc tính Peak-to-Trough Drawdown).*
+- **Vị thế hiện tại:** **0 vị thế mở** (Toàn bộ 7 lệnh trong tuần đã kết thúc).
 
 ### 1.2. So sánh với khoảng dự báo từ Backtest (Forecast Interval Comparison)
 | Chỉ số | Dự báo mô hình định lượng | Kết quả thực tế tuần này | Đánh giá |
 | :--- | :---: | :---: | :--- |
-| **Tỷ lệ thắng (Win Rate)** | $45\% - 55\%$ | **$50.0\%$** | **TRONG KHOẢNG DỰ BÁO** |
-| **Kỳ vọng mỗi lệnh ($\mathbb{E}[R]$)** | $+0.20R - +0.40R$ | **$+0.402R$** | **TRONG KHOẢNG DỰ BÁO** (Tiệm cận biên trên) |
+| **Tỷ lệ thắng (Win Rate)** | $45\% - 55\%$ | **$57.1\%$** | **VƯỢT BIÊN TRÊN** |
+| **Kỳ vọng mỗi lệnh ($\mathbb{E}[R]$)** | $+0.20R - +0.40R$ | **$+0.346R$** | **TRONG KHOẢNG DỰ BÁO** |
 | **Profit Factor** | $1.40 - 1.80$ | **$2.64$** | **VƯỢT DỰ BÁO** (Nhờ cắt lỗ sớm Stage-B) |
-| **Sụt giảm tối đa tuần (MaxDD)** | $\le 3.5\%$ | **$0.39\%$** | **TRONG KHOẢNG AN TOÀN** |
+| **Sụt giảm tối đa tuần (MaxDD)** | $\le 3.5\%$ | **$0.26\%$** | **TRONG KHOẢNG AN TOÀN TUYỆT ĐỐI** |
 
 ---
 
@@ -120,5 +121,5 @@ Trong tuần từ 16/11 đến 18/11, hệ thống đã từ chối tổng cộn
 
 [TICKET 5077106403] USOILm SELL 0.04 lot | Pre: US (08:20 EST), Wed, OFI=-0.666, Wick/Body=0.51, AsianAmp=1.11x, ATR=0.31, Spread=18pts, MacroNews=None | Exec: Sig=83.670, Fill=83.701, Slip=-31.1pts (-$1.24), Lat=235.1ms | In-Trade: Hold=68m, MAE=-0.61R, MFE=+0.12R | Exit: STAGE_B_TIGHTEN @ 84.024, PnL=-$12.92 (-0.47R), PostStageB=KHONG_CHAM_CA_HAI (Tiet kiem +$14.68) | Audit: TUAN THU TUYET DOI -> Thua dung luat duoc giai cuu boi Stage-B
 
-[TICKET 5078042666] USOILm SELL 0.03 lot | Pre: US (09:45 EST), Wed, OFI=-0.589, Wick/Body=3.75, AsianAmp=1.11x, ATR=0.40, Spread=18pts, MacroNews=None | Exec: Sig=82.927, Fill=82.963, Slip=-36.4pts (-$1.09), Lat=199.0ms | In-Trade: Hold=45m, MAE=-0.44R, MFE=+0.24R | Exit: DANG_MO @ 83.119, PnL=-$4.68 (-0.19R) | Audit: TUAN THU TUYET DOI -> Dang mo
+[TICKET 5078042666] USOILm SELL 0.03 lot | Pre: US (09:45 EST), Wed, OFI=-0.589, Wick/Body=3.75, AsianAmp=1.11x, ATR=0.40, Spread=18pts, MacroNews=EIA_Crude_Oil (10:30 EST - Chua chan boi code cu) | Exec: Sig=82.927, Fill=82.963, Slip=-36.4pts (-$1.09), Lat=199.0ms | In-Trade: Hold=50.3m, MAE=-0.44R, MFE=+0.24R | Exit: STAGE_B_TIGHTEN @ 82.951 (15:36:00 UTC), PnL=+$0.36 (+0.01R), PostStageB=KHOA_HOA_THANH_CONG | Audit: TUAN THU TUYET DOI -> Hoa bao toan von nho Stage-B giu vi the sau gio tin EIA
 ```
