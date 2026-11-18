@@ -58,6 +58,45 @@ logger = setup_logger(
     log_level=system_cfg.get("log_level", "INFO")
 )
 
+# OS-Level Process Mutex Lock (quant_bot.lock) to eliminate multi-threaded/duplicate process race conditions
+LOCK_FILE = _ROOT / "quant_bot.lock"
+_lock_handle = None
+
+def acquire_process_lock():
+    global _lock_handle
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            _lock_handle = open(LOCK_FILE, "a+")
+            msvcrt.locking(_lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            _lock_handle = open(LOCK_FILE, "a+")
+            fcntl.flock(_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info(f"🔒 [MUTEX] Acquired exclusive OS process lock: {LOCK_FILE.name}")
+        return True
+    except (IOError, OSError) as e:
+        logger.critical(f"🛑 [MUTEX ERROR] Another bot instance is already running! Mutex lock failed: {e}")
+        print(f"🛑 [FATAL] Another bot instance is already holding {LOCK_FILE.name}. Exiting to prevent double-fills.")
+        sys.exit(1)
+
+def release_process_lock():
+    global _lock_handle
+    if _lock_handle:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(_lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(_lock_handle, fcntl.LOCK_UN)
+            _lock_handle.close()
+            if LOCK_FILE.exists():
+                LOCK_FILE.unlink(missing_ok=True)
+            logger.info("🔓 [MUTEX] Released OS process lock.")
+        except Exception as e:
+            logger.error(f"[MUTEX] Error releasing lock: {e}")
+
 _running = True
 
 
@@ -73,6 +112,7 @@ signal.signal(signal.SIGTERM, _handle_exit)
 
 def main():
     global _running
+    acquire_process_lock()
 
     live_trading_env = os.getenv("LIVE_TRADING", "false").lower() in ("true", "1", "yes")
 
@@ -133,7 +173,11 @@ def main():
         consecutive_loss_cooldowns=tuple(risk_cfg.get("consecutive_loss_cooldowns", [300, 2700, -1])),
         max_trailing_drawdown_pct=risk_cfg.get("max_trailing_drawdown_pct", 0.08),
         max_positions_per_cluster=risk_cfg.get("max_positions_per_cluster", 2),
-        auto_write_halt_file=risk_cfg.get("auto_write_halt_file", True)
+        auto_write_halt_file=risk_cfg.get("auto_write_halt_file", True),
+        macro_news_window_utc=tuple(risk_cfg.get("macro_news_window_utc", ["14:15", "14:45"])),
+        macro_news_symbols=tuple(risk_cfg.get("macro_news_symbols", ["XAUUSDm", "US30m", "USOILm", "GBPUSDm"])),
+        hard_daily_target_usd=float(risk_cfg.get("hard_daily_target_usd", 200.0)),
+        fat_tail_override_enabled=bool(risk_cfg.get("fat_tail_override_enabled", True))
     )
     risk_desk.update_account_state(acc)
 
@@ -299,34 +343,127 @@ def main():
 
                     tp_dist = abs(p.tp - p.price_open)
                     profit_dist = (p.price_current - p.price_open) if p.type == 0 else (p.price_open - p.price_current)
-                    
-                    # Nautilus Time-Barrier Exit (Alpha Decay Horizon from Config)
-                    max_holding_bars = risk_cfg.get("max_holding_bars_m15", 5)
-                    max_holding_sec = max_holding_bars * 15 * 60
-                    pos_age_sec = time.time() - p.time
-                    if pos_age_sec >= max_holding_sec:
-                        now_ts = time.time()
-                        if now_ts - last_close_attempts.get(p.ticket, 0) >= 300:  # retry every 5m if market closed
-                            last_close_attempts[p.ticket] = now_ts
-                            logger.info(f"⏳ [TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/60:.1f}m (Alpha Decay Horizon: {max_holding_sec/60:.0f}m)")
-                            closed_ok, close_msg = mt5_bridge.close_position(p, comment="TIME_BARRIER")
-                            if not closed_ok and ("10018" in str(close_msg) or "closed" in str(close_msg).lower()):
-                                logger.info(f"⏸️ [MARKET_CLOSED] Ticket #{p.ticket} {p.symbol} will auto-close when market opens.")
-                        continue
 
-                    # Tier 1: Dynamic ATR Trailing Stop with Guaranteed Breakeven Floor
-                    trailing_cfg = risk_cfg.get("trailing_stop", {})
-                    if trailing_cfg.get("enabled", True) and tp_dist > 0:
-                        # Quick ATR calculation from recent bars
-                        rates_recent = mt5_bridge.get_rates_df(p.symbol, timeframe="M15", count=20)
+                    # Compute current ATR14 for asset-specific breakeven & trailing thresholds
+                    current_atr = buffer_pts * 2.0
+                    try:
+                        rates_recent = mt5_bridge.get_rates_df(p.symbol, timeframe="M15", count=25)
                         if rates_recent is not None and len(rates_recent) >= 14:
                             hl = rates_recent["high"] - rates_recent["low"]
                             hc = (rates_recent["high"] - rates_recent["close"].shift(1)).abs()
                             lc = (rates_recent["low"] - rates_recent["close"].shift(1)).abs()
                             current_atr = float(pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean().iloc[-1])
-                        else:
-                            current_atr = buffer_pts * 2.0
+                    except Exception as e_atr:
+                        logger.debug(f"ATR calculation error for {p.symbol}: {e_atr}")
 
+                    # STAGE A (Early Breakeven Lock at +1.0R / +1.5x ATR):
+                    # As soon as an open XAUUSDm or USOILm position reaches unrealized profit >= 1.5x ATR14 (~$4.50 / ~$0.40),
+                    # immediately move SL to Entry +/- $0.35 (covering Exness spread + Contabo slippage)
+                    be_offset = 0.35 if "XAU" in sym_upper else (0.05 if "OIL" in sym_upper else buffer_pts)
+                    be_profit_threshold = current_atr * 1.5
+                    if profit_dist >= be_profit_threshold:
+                        if p.type == 0:  # BUY
+                            be_sl = p.price_open + be_offset
+                            if p.sl < be_sl:
+                                logger.info(
+                                    f"🛡️ [STAGE A - BREAKEVEN LOCK] Ticket #{p.ticket} {p.symbol} BUY reached +1.5x ATR "
+                                    f"(+${profit_dist:.2f} >= ${be_profit_threshold:.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}"
+                                )
+                                mt5_bridge.modify_position_sl(p, be_sl)
+                        elif p.type == 1:  # SELL
+                            be_sl = p.price_open - be_offset
+                            if p.sl > be_sl or p.sl == 0:
+                                logger.info(
+                                    f"🛡️ [STAGE A - BREAKEVEN LOCK] Ticket #{p.ticket} {p.symbol} SELL reached +1.5x ATR "
+                                    f"(+${profit_dist:.2f} >= ${be_profit_threshold:.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}"
+                                )
+                                mt5_bridge.modify_position_sl(p, be_sl)
+
+                    # Pre-News Macro Window Guard (14:15 - 14:45 UTC)
+                    # Automatically moves SL to Breakeven (+ buffer) for any profitable USD-sensitive position
+                    is_macro_news = risk_desk.is_macro_news_window(now_utc)
+                    if is_macro_news and getattr(p, "profit", 0.0) > 0 and sym_upper in ("XAUUSDM", "US30M", "USOILM", "GBPUSDM"):
+                        if p.type == 0:  # BUY
+                            be_sl = p.price_open + be_offset
+                            if p.sl < be_sl:
+                                logger.info(f"🛡️ [PRE-NEWS BREAKEVEN] Ticket #{p.ticket} {p.symbol} BUY in profit (${p.profit:+.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}")
+                                mt5_bridge.modify_position_sl(p, be_sl)
+                        elif p.type == 1:  # SELL
+                            be_sl = p.price_open - be_offset
+                            if p.sl > be_sl or p.sl == 0:
+                                logger.info(f"🛡️ [PRE-NEWS BREAKEVEN] Ticket #{p.ticket} {p.symbol} SELL in profit (${p.profit:+.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}")
+                                mt5_bridge.modify_position_sl(p, be_sl)
+
+                    # STAGE B: 45m Stagnation Trailing-Tighten (3 M15 bars, empirical WR peaks at 52.6%)
+                    stagnation_min = risk_cfg.get("stagnation_timeout_minutes", 45)
+                    max_holding_sec = stagnation_min * 60
+                    pos_age_sec = time.time() - p.time
+                    if pos_age_sec >= max_holding_sec:
+                        # Extract H1 trend and M15 OFI for conditional extension check
+                        h1_bullish = None
+                        m15_ofi = None
+                        try:
+                            rates_m15 = mt5_bridge.get_rates_df(p.symbol, timeframe="M15", count=25)
+                            h1_rates = mt5_bridge.get_rates_df(p.symbol, timeframe="H1", count=210)
+                            if rates_m15 is not None and len(rates_m15) >= 20:
+                                from strategies.gold_micro_scalper import calculate_order_flow_imbalance
+                                m15_ofi = float(calculate_order_flow_imbalance(rates_m15.iloc[:-1], window=5))
+                            if h1_rates is not None and len(h1_rates) >= 200:
+                                h1_c = h1_rates["close"].iloc[:-1]
+                                h1_ema50 = float(h1_c.ewm(span=50, adjust=False).mean().iloc[-1])
+                                h1_ema200 = float(h1_c.ewm(span=200, adjust=False).mean().iloc[-1])
+                                h1_bullish = (h1_ema50 > h1_ema200)
+                        except Exception as e_ind:
+                            logger.debug(f"Error computing indicators for conditional time-barrier: {e_ind}")
+
+                        should_close, close_reason = risk_desk.evaluate_conditional_time_barrier(
+                            symbol=p.symbol,
+                            pos_type=p.type,
+                            pos_age_sec=pos_age_sec,
+                            price_open=p.price_open,
+                            price_current=p.price_current,
+                            initial_sl=p.sl,
+                            base_horizon_sec=max_holding_sec,
+                            extended_horizon_sec=max_holding_sec + (30 * 60),  # 75m
+                            h1_trend_bullish=h1_bullish,
+                            m15_ofi=m15_ofi
+                        )
+
+                        if should_close:
+                            # Stagnation Trailing-Tighten: tighten SL to current_price +/- $0.20 ($0.05 on Oil) to avoid spread drag
+                            tight_buffer = 0.20 if "XAU" in sym_upper else (0.05 if "OIL" in sym_upper else buffer_pts * 0.5)
+                            if p.type == 0:  # BUY
+                                tight_sl = p.price_current - tight_buffer
+                                if tight_sl > p.sl:
+                                    logger.info(
+                                        f"🎯 [STAGE B - TRAILING-TIGHTEN] Stagnation ({pos_age_sec/60:.1f}m >= {stagnation_min}m). "
+                                        f"Tightening SL on Ticket #{p.ticket} {p.symbol} from {p.sl:.5f} to {tight_sl:.5f} (Buffer: ${tight_buffer:.2f}) to avoid spread drag."
+                                    )
+                                    mt5_bridge.modify_position_sl(p, tight_sl)
+                            elif p.type == 1:  # SELL
+                                tight_sl = p.price_current + tight_buffer
+                                if tight_sl < p.sl or p.sl == 0:
+                                    logger.info(
+                                        f"🎯 [STAGE B - TRAILING-TIGHTEN] Stagnation ({pos_age_sec/60:.1f}m >= {stagnation_min}m). "
+                                        f"Tightening SL on Ticket #{p.ticket} {p.symbol} from {p.sl:.5f} to {tight_sl:.5f} (Buffer: ${tight_buffer:.2f}) to avoid spread drag."
+                                    )
+                                    mt5_bridge.modify_position_sl(p, tight_sl)
+
+                            # Hard emergency exit past 75m or Friday flat
+                            if pos_age_sec >= (max_holding_sec + 30 * 60) or risk_desk.is_friday_hard_flat_time(now_utc):
+                                now_ts = time.time()
+                                if now_ts - last_close_attempts.get(p.ticket, 0) >= 300:
+                                    last_close_attempts[p.ticket] = now_ts
+                                    logger.info(f"⏳ [HARD-TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/60:.1f}m ({close_reason})")
+                                    mt5_bridge.close_position(p, comment="TIME_BARRIER")
+                            continue
+                        else:
+                            if int(pos_age_sec) % 300 < 5:
+                                logger.info(f"⏳ [TIME-BARRIER EXTENSION] Ticket #{p.ticket} {p.symbol} held {pos_age_sec/60:.1f}m: {close_reason}")
+
+                    # Tier 1: Dynamic ATR Trailing Stop with Guaranteed Breakeven Floor (for trend continuation)
+                    trailing_cfg = risk_cfg.get("trailing_stop", {})
+                    if trailing_cfg.get("enabled", True) and tp_dist > 0:
                         if "XAU" in sym_upper:
                             atr_mult = 2.2  # Broadened to 2.2x ATR to give Gold trend breathing room
                         else:
@@ -335,7 +472,7 @@ def main():
 
                         if p.type == 0:  # BUY
                             if profit_dist >= max(current_atr * 1.5, tp_dist * min_gain_ratio):
-                                be_sl = p.price_open + buffer_pts
+                                be_sl = p.price_open + be_offset
                                 dyn_sl = pos_meta["highest_high"] - (atr_mult * current_atr)
                                 target_sl = max(be_sl, dyn_sl)
                                 if p.sl < target_sl:
@@ -344,7 +481,7 @@ def main():
 
                         elif p.type == 1:  # SELL
                             if profit_dist >= max(current_atr * 1.5, tp_dist * min_gain_ratio):
-                                be_sl = p.price_open - buffer_pts
+                                be_sl = p.price_open - be_offset
                                 dyn_sl = pos_meta["lowest_low"] + (atr_mult * current_atr)
                                 target_sl = min(be_sl, dyn_sl)
                                 if p.sl > target_sl or p.sl == 0:
@@ -368,7 +505,7 @@ def main():
                 now_ts = time.time()
 
                 # 1. HARD WEEKEND / OVERNIGHT FLATTEN GUARD (Chặn lỗ qua tuần như lệnh USOILm -$153)
-                friday_close_hm = strat.config.get("friday_hard_close_utc", "20:30")
+                friday_close_hm = getattr(risk_desk, "friday_hard_flat_utc", None) or strat.config.get("friday_hard_close_utc", "13:00")
                 if "BTC" not in sym.upper() and now_utc_dt.weekday() == 4 and now_utc_dt.strftime("%H:%M") >= friday_close_hm:
                     sym_open_positions = [p for p in open_pos_all if p.symbol == sym and p.magic == strat.magic]
                     for pos in sym_open_positions:
@@ -447,10 +584,11 @@ def main():
                 min_lot = sym_info.volume_min if sym_info else 0.01
                 lot_step = sym_info.volume_step if sym_info else 0.01
 
-                # Evaluate strategy with Nautilus De-risking Multiplier & Tier 1 Pod Recovery Sizing
+                # Evaluate strategy with Nautilus De-risking Multiplier, Session Multiplier & Tier 1 Pod Recovery Sizing
                 risk_mult = risk_desk.get_risk_multiplier(acc["equity"])
                 pod_mult = risk_desk.get_symbol_risk_multiplier(sym)
-                effective_risk_mult = risk_mult * pod_mult
+                session_lot_mult = risk_desk.get_session_lot_multiplier(sym, now_utc_dt)
+                effective_risk_mult = risk_mult * pod_mult * session_lot_mult
                 if effective_risk_mult <= 0:
                     continue
 

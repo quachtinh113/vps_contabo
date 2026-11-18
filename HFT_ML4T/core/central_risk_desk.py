@@ -52,7 +52,14 @@ class CentralRiskDesk:
         cluster_map: Optional[Dict[str, list]] = None,
         auto_write_halt_file: bool = True,
         max_acceptable_slippage_points: float = 25.0, # Slippage barrier cap in points
-        max_acceptable_latency_ms: float = 1200.0     # Execution latency barrier cap in ms
+        max_acceptable_latency_ms: float = 1200.0,    # Execution latency barrier cap in ms
+        macro_news_window_utc: Optional[Tuple[str, str]] = None,
+        macro_news_symbols: Tuple[str, ...] = ("XAUUSDM", "US30M", "USOILM", "GBPUSDM"),
+        hard_daily_target_usd: float = 200.0,
+        fat_tail_override_enabled: bool = True,
+        weekday_targets_usd: Optional[Dict[int, float]] = None,
+        asia_sub_stop_usd: float = 35.0,
+        friday_hard_flat_utc: str = "13:00"
     ):
         self.max_daily_drawdown_usd = max_daily_drawdown_usd
         self.max_daily_drawdown_pct = max_daily_drawdown_pct
@@ -71,6 +78,19 @@ class CentralRiskDesk:
         self.auto_write_halt_file = auto_write_halt_file
         self.max_acceptable_slippage_points = max_acceptable_slippage_points
         self.max_acceptable_latency_ms = max_acceptable_latency_ms
+        self.macro_news_window_utc = macro_news_window_utc
+        self.macro_news_symbols = {s.upper().replace(".M", "").replace("M", "") + "M" for s in macro_news_symbols}
+        self.hard_daily_target_usd = hard_daily_target_usd
+        self.fat_tail_override_enabled = fat_tail_override_enabled
+        self.weekday_targets_usd = weekday_targets_usd or {
+            0: 150.0,  # Monday ($150)
+            1: 200.0,  # Tuesday ($200)
+            2: 200.0,  # Wednesday ($200)
+            3: 280.0,  # Thursday ($280)
+            4: 170.0   # Friday ($170) -> Total $1,000/week
+        }
+        self.asia_sub_stop_usd = asia_sub_stop_usd
+        self.friday_hard_flat_utc = friday_hard_flat_utc
 
         self._daily_peak_equity = 0.0
         self._all_time_peak_equity = 0.0
@@ -81,6 +101,8 @@ class CentralRiskDesk:
         self._symbol_cooldowns: Dict[str, float] = {}
         self._consecutive_losses: Dict[str, int] = {}
         self._daily_symbol_pnl: Dict[str, float] = {}
+        self._asia_realized_pnl = 0.0
+        self._peak_daily_realized_pnl = 0.0
         self._symbol_locked_for_day: Dict[str, bool] = {}
         self._symbol_recovery_trades: Dict[str, int] = {}
         self._execution_history: Dict[str, list] = {}
@@ -165,6 +187,8 @@ class CentralRiskDesk:
             self._daily_peak_equity = current_equity
             self._consecutive_losses.clear()
             self._daily_symbol_pnl.clear()
+            self._asia_realized_pnl = 0.0
+            self._peak_daily_realized_pnl = 0.0
             self._symbol_locked_for_day.clear()
             self._symbol_cooldowns.clear()
             logger.info(
@@ -175,18 +199,75 @@ class CentralRiskDesk:
             if current_equity > self._daily_peak_equity:
                 self._daily_peak_equity = current_equity
 
+    def get_today_target(self, now_utc: Optional[datetime] = None) -> float:
+        """Returns baseline profit target based on weekday (Mon $150, Tue/Wed $200, Thu $280, Fri $170)."""
+        dt = now_utc or datetime.now(timezone.utc)
+        weekday = dt.weekday()
+        return self.weekday_targets_usd.get(weekday, self.hard_daily_target_usd)
+
+    def get_current_session(self, now_utc: Optional[datetime] = None) -> str:
+        """Identifies active microstructure session: ASIA, LONDON, or US."""
+        dt = now_utc or datetime.now(timezone.utc)
+        cur_hm = dt.strftime("%H:%M")
+        if "00:00" <= cur_hm < "07:00":
+            return "ASIA"
+        elif "07:00" <= cur_hm < "13:00":
+            return "LONDON"
+        elif "13:00" <= cur_hm < "20:00":
+            return "US"
+        else:
+            return "OFF_HOURS"
+
+    def get_session_lot_multiplier(self, symbol: str, now_utc: Optional[datetime] = None) -> float:
+        """Returns lot scaling factor (0.5x in Asia for XAUUSDm, 1.0x in London/US)."""
+        dt = now_utc or datetime.now(timezone.utc)
+        session = self.get_current_session(dt)
+        if session == "ASIA" and "XAU" in symbol.upper():
+            return 0.50  # 0.25% risk per trade in Asia
+        return 1.0
+
+    def get_dynamic_daily_floor(self, now_utc: Optional[datetime] = None) -> float:
+        """
+        Calculates the Inter-Session One-Way Profit Ratchet (Dynamic Daily Floor).
+        - Rule 1 (London Banked Gains Protection): If peak realized PnL reaches >= 50% of today's target
+          (e.g., >= +$100 on a $200 day, or +$110 London quota), ratchets floor to at least 50% of peak gains
+          (min $50.00), preventing the US session from wiping out morning alpha.
+        - Rule 2 (Fat-Tail Runner Ratchet): If peak realized PnL exceeds today's target (e.g., >= +$200),
+          ratchets floor to 75% of target (e.g., +$150.00), locking baseline while hunting upside.
+        """
+        today_target = self.get_today_target(now_utc)
+        peak = self._peak_daily_realized_pnl
+
+        if peak >= today_target:
+            # Rule 2: Lock at least 75% of baseline weekday target
+            return today_target * 0.75
+        elif peak >= (today_target * 0.50):
+            # Rule 1: Lock at least 50% of peak banked gains (minimum $50 floor)
+            return max(peak * 0.50, 50.0)
+
+        return -self.max_daily_drawdown_usd
+
     def check_pre_trade_safety(
         self,
         symbol: str,
         current_spread_points: float,
         max_allowed_spread_points: float,
         open_positions: list,
-        account_info: Dict[str, Any]
+        account_info: Dict[str, Any],
+        signal_regime: str = "BASELINE",
+        now_utc: Optional[datetime] = None
     ) -> Tuple[bool, str]:
         """
         Executes pre-flight institutional risk checks before any order is submitted.
         Returns (is_approved: bool, reason: str).
         """
+        cur_dt = now_utc or datetime.now(timezone.utc)
+        cur_hm = cur_dt.strftime("%H:%M")
+
+        # 0. Friday Hard Flat Check (13:00 UTC / 20:00 VN)
+        if cur_dt.weekday() == 4 and cur_hm >= self.friday_hard_flat_utc:
+            return False, f"Friday Hard Flat window reached ({cur_hm} >= {self.friday_hard_flat_utc} UTC / 20:00 VN). All trading halted for weekend."
+
         # 1. Manual Kill-Switch Check (With Auto Daily Reset for prior day Daily DD)
         self.check_and_reset_daily_halt()
 
@@ -198,6 +279,34 @@ class CentralRiskDesk:
         if self._is_halted:
             return False, f"Risk Desk is HALTED: {self._halt_reason}"
 
+        # 1.2 Three-Session Dynamic Microstructure Gating
+        session = self.get_current_session(cur_dt)
+        daily_realized_pnl = sum(self._daily_symbol_pnl.values())
+        today_target = self.get_today_target(cur_dt)
+
+        if session == "ASIA":
+            if "OIL" in symbol.upper():
+                return False, f"USOILm is disabled during Asia Session (00:00-07:00 UTC). Activated only in US Session (13:00-20:00 UTC)."
+            if self._asia_realized_pnl <= -self.asia_sub_stop_usd:
+                return False, f"Asia Session sub-stop breached (-${abs(self._asia_realized_pnl):.2f} <= -${self.asia_sub_stop_usd:.2f}). Paused until London Open (07:00 UTC)."
+        elif session == "LONDON":
+            if "OIL" in symbol.upper():
+                return False, f"USOILm is disabled during London Session (07:00-13:00 UTC). Activated only in US Session (13:00-20:00 UTC)."
+            # London cumulative quota lock (55% of weekday target, e.g. +$110 on $200 day)
+            london_lock_threshold = today_target * 0.55
+            if daily_realized_pnl >= london_lock_threshold:
+                return False, f"London/Asia quota reached (+${daily_realized_pnl:.2f} >= +${london_lock_threshold:.2f}). Paused until US Open (13:00 UTC) to bank morning alpha."
+
+        # 1.25 Inter-Session One-Way Profit Ratchet (Dynamic Daily Floor)
+        dynamic_floor = self.get_dynamic_daily_floor(cur_dt)
+        if self._peak_daily_realized_pnl >= (today_target * 0.50):
+            if daily_realized_pnl <= dynamic_floor:
+                return False, (
+                    f"Inter-Session Profit Ratchet active: Daily Realized PnL (+${daily_realized_pnl:,.2f}) dropped "
+                    f"to/below Dynamic Daily Floor (+${dynamic_floor:,.2f}) from peak (+${self._peak_daily_realized_pnl:,.2f}). "
+                    f"Trading halted for remainder of day to lock in banked morning/session alpha."
+                )
+
         # 1.5 Per-Symbol Isolation Circuit Breaker (Daily loss cap & consecutive losses)
         if self._symbol_locked_for_day.get(symbol, False):
             return False, f"Symbol {symbol} is locked for remainder of day (Loss cap or consecutive losses breached)"
@@ -207,8 +316,28 @@ class CentralRiskDesk:
             self._symbol_locked_for_day[symbol] = True
             return False, f"Symbol {symbol} breached daily loss cap (-${abs(sym_pnl):.2f} >= ${self.max_daily_loss_per_symbol_usd:.2f})"
 
-        # 2. Daily Drawdown Guard
+        # 1.8 Dual-Mode Realized Daily Target & Hard Drawdown Guard
         current_equity = account_info.get("equity", 0.0)
+
+        if daily_realized_pnl <= -self.max_daily_drawdown_usd:
+            reason = f"Daily Loss Hard Stop triggered: Realized PnL -${abs(daily_realized_pnl):,.2f} <= -${self.max_daily_drawdown_usd:,.2f}"
+            self._trigger_emergency_halt(reason, current_equity)
+            return False, reason
+
+        if daily_realized_pnl >= today_target:
+            is_us_session = ("13:00" <= cur_hm <= "17:00")
+            if self.fat_tail_override_enabled and signal_regime == "FAT_TAIL" and is_us_session:
+                logger.info(
+                    f"🚀 [FAT-TAIL CONVICTION OVERRIDE] Daily target reached (+${daily_realized_pnl:,.2f} >= ${today_target:,.2f}), "
+                    f"but FAT_TAIL conviction signal detected during US Session! Bypassing ${today_target:.0f} lock for asymmetric upside."
+                )
+            else:
+                return False, (
+                    f"Daily Profit Target Reached (+${daily_realized_pnl:,.2f} >= ${today_target:,.2f}). "
+                    f"Hard Daily Target Lock active to bank baseline profits."
+                )
+
+        # 2. Daily Drawdown Guard
         if self._daily_peak_equity > 0:
             dd_usd = self._daily_peak_equity - current_equity
             dd_pct = dd_usd / self._daily_peak_equity
@@ -250,11 +379,19 @@ class CentralRiskDesk:
                 return False, f"Margin level {margin_level:.1f}% < safe minimum {self.min_margin_level_percent}%"
 
         # 4. Rollover Curfew Check (Avoid severe Exness spread spikes 21:45-22:30 UTC)
-        now_utc = datetime.now(timezone.utc)
-        current_time_str = now_utc.strftime("%H:%M")
+        cur_dt = now_utc or datetime.now(timezone.utc)
+        current_time_str = cur_dt.strftime("%H:%M")
         start_curfew, end_curfew = self.rollover_curfew_utc
         if start_curfew <= current_time_str <= end_curfew:
             return False, f"Rollover Curfew Active ({start_curfew} - {end_curfew} UTC). Spread risk elevated."
+
+        # 4.5 Macro News Release Window Guard (14:15 - 14:45 UTC)
+        # Blocks new entries on USD/macro sensitive assets during major US economic releases (e.g., NFP, CPI)
+        if self.macro_news_window_utc:
+            start_news, end_news = self.macro_news_window_utc
+            sym_clean = symbol.upper().replace(".M", "").replace("M", "") + "M"
+            if (symbol.upper() in self.macro_news_symbols or sym_clean in self.macro_news_symbols) and (start_news <= current_time_str <= end_news):
+                return False, f"Macro News Release Window Active ({start_news} - {end_news} UTC). New {symbol} orders blocked for event risk."
 
         # 5. Live Spread Guard
         if current_spread_points > max_allowed_spread_points:
@@ -307,6 +444,16 @@ class CentralRiskDesk:
         """
         self._daily_symbol_pnl[symbol] = self._daily_symbol_pnl.get(symbol, 0.0) + profit
         sym_pnl = self._daily_symbol_pnl[symbol]
+
+        # Update Asia session sub-pnl
+        cur_dt = datetime.now(timezone.utc)
+        if self.get_current_session(cur_dt) == "ASIA":
+            self._asia_realized_pnl += profit
+
+        # Update Daily Peak Realized PnL for One-Way Profit Ratchet
+        daily_realized_pnl = sum(self._daily_symbol_pnl.values())
+        if daily_realized_pnl > self._peak_daily_realized_pnl:
+            self._peak_daily_realized_pnl = daily_realized_pnl
 
         if profit >= 0:
             self._consecutive_losses[symbol] = 0
@@ -494,5 +641,67 @@ class CentralRiskDesk:
         self._symbol_cooldowns.clear()
         self._consecutive_losses.clear()
         self._daily_symbol_pnl.clear()
+        self._asia_realized_pnl = 0.0
+        self._peak_daily_realized_pnl = 0.0
         self._symbol_locked_for_day.clear()
         logger.info("[RISK] Central Risk Desk manually unlocked.")
+
+    def is_macro_news_window(self, now_utc: Optional[datetime] = None) -> bool:
+        """Returns True if current time is within US macro data release window (14:15 - 14:45 UTC)."""
+        if not self.macro_news_window_utc:
+            return False
+        dt = now_utc or datetime.now(timezone.utc)
+        hm = dt.strftime("%H:%M")
+        start_news, end_news = self.macro_news_window_utc
+        return start_news <= hm <= end_news
+
+    def is_friday_hard_flat_time(self, now_utc: Optional[datetime] = None) -> bool:
+        """Returns True if current time is Friday at or after friday_hard_flat_utc (13:00 UTC / 20:00 VN)."""
+        dt = now_utc or datetime.now(timezone.utc)
+        return dt.weekday() == 4 and dt.strftime("%H:%M") >= self.friday_hard_flat_utc
+
+    def evaluate_conditional_time_barrier(
+        self,
+        symbol: str,
+        pos_type: int,
+        pos_age_sec: float,
+        price_open: float,
+        price_current: float,
+        initial_sl: float,
+        base_horizon_sec: float = 4500.0,
+        extended_horizon_sec: float = 6300.0,
+        h1_trend_bullish: Optional[bool] = None,
+        m15_ofi: Optional[float] = None
+    ) -> Tuple[bool, str]:
+        """
+        Evaluates whether an aging position at 75m should be extended by 30m (up to 105m)
+        or closed immediately.
+        Returns (should_close: bool, reason: str).
+        """
+        if pos_age_sec < base_horizon_sec:
+            return False, "WITHIN_BASE_HORIZON"
+
+        if pos_age_sec >= extended_horizon_sec:
+            return True, f"MAX_EXTENDED_HORIZON_REACHED ({pos_age_sec/60:.1f}m >= {extended_horizon_sec/60:.0f}m)"
+
+        profit_dist = (price_current - price_open) if pos_type == 0 else (price_open - price_current)
+        sl_dist = abs(price_open - initial_sl) if initial_sl > 0 else 0.0
+        r_mult = (profit_dist / sl_dist) if sl_dist > 0 else 0.0
+
+        # Slight drawdown (-0.35R <= r_mult <= 0.05R)
+        is_slight_drawdown = (-0.35 <= r_mult <= 0.05)
+
+        trend_aligned = False
+        if pos_type == 0:  # BUY
+            h1_ok = (h1_trend_bullish is True) or (h1_trend_bullish is None)
+            ofi_ok = (m15_ofi is None) or (m15_ofi >= 0.0)
+            trend_aligned = h1_ok and ofi_ok
+        elif pos_type == 1:  # SELL
+            h1_ok = (h1_trend_bullish is False) or (h1_trend_bullish is None)
+            ofi_ok = (m15_ofi is None) or (m15_ofi <= 0.0)
+            trend_aligned = h1_ok and ofi_ok
+
+        if is_slight_drawdown and trend_aligned:
+            return False, f"EXTENDED_HORIZON: Slight drawdown ({r_mult:+.2f}R), H1 trend and OFI aligned. Horizon extended to 105m."
+        else:
+            return True, f"ALPHA_DECAY_EXIT: R-mult={r_mult:+.2f}R, trend_aligned={trend_aligned}"

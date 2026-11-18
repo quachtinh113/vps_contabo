@@ -139,6 +139,36 @@ class CryptoMicroScalperStrategy:
         if mid_price <= 0 or spread_pts > self.max_spread_points:
             return None
 
+        # Tier 2: Session Volatility Filter (Khóa phiên Á: 00:00 - 12:00 UTC, chỉ giao dịch phiên Âu-Mỹ)
+        session_utc = self.config.get("trading_session_utc")
+        cur_dt = now_utc or datetime.now(timezone.utc)
+        cur_hm = cur_dt.strftime("%H:%M")
+        if session_utc and len(session_utc) == 2:
+            if not (session_utc[0] <= cur_hm <= session_utc[1]):
+                self._log_throttled(
+                    "OUTSIDE_SESSION",
+                    f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: OUTSIDE_SESSION "
+                    f"({cur_hm} UTC not in active window {session_utc[0]} - {session_utc[1]} UTC)"
+                )
+                return None
+
+        # 0.1 Dynamic Spread-to-ATR Barrier (Chặn quét râu do giãn spread thanh khoản mỏng)
+        max_spread_atr_ratio = self.config.get("max_spread_to_atr_ratio")
+        if max_spread_atr_ratio:
+            high = df_m15["high"]
+            low = df_m15["low"]
+            prev_close = df_m15["close"].shift(1)
+            tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+            atr14_val = float(tr.rolling(window=14).mean().iloc[-1])
+            spread_dist = float(market_snapshot.get("ask", 0.0) - market_snapshot.get("bid", 0.0))
+            if atr14_val > 0 and (spread_dist / atr14_val) > max_spread_atr_ratio:
+                self._log_throttled(
+                    "SPREAD_ATR_SPIKE",
+                    f"🛡️ [FILTER_REJECT] {self.symbol} - Reason: SPREAD_ATR_SPIKE "
+                    f"(Spread ${spread_dist:.2f} is {(spread_dist / atr14_val)*100:.1f}% of ATR14 ${atr14_val:.2f} > {max_spread_atr_ratio*100:.0f}%)"
+                )
+                return None
+
         # 0. Volume Filter: Volume >= min_multiplier * SMA(Volume, 20)
         vol_ratio = 1.0
         if "tick_volume" in df_m15.columns and len(df_m15) >= (self.volume_sma_period + 1):

@@ -9,13 +9,46 @@ system:
   log_dir: "logs"
 
 risk_desk:
-  max_daily_drawdown_usd: 300.0    # Hard halt if daily loss reaches $300
-  max_daily_drawdown_pct: 0.05     # 5.0% maximum daily drawdown
-  warning_drawdown_pct: 0.025      # 2.5% warning trigger
+  max_daily_drawdown_usd: 100.0    # Institutional Circuit Breaker: Hard halt if daily loss reaches -$100 (1.0% Equity)
+  max_daily_drawdown_pct: 0.02     # 2.0% maximum daily drawdown
+  hard_daily_target_usd: 200.0     # Baseline Hard Daily Target
+  weekly_baseline_target_usd: 1000.0 # $1,000/week baseline target
+  weekday_targets_usd:
+    0: 150.0  # Monday ($150)
+    1: 200.0  # Tuesday ($200)
+    2: 200.0  # Wednesday ($200)
+    3: 280.0  # Thursday ($280)
+    4: 170.0  # Friday ($170)
+  sessions:
+    asia:
+      window_utc: ["00:00", "07:00"]
+      quota_pct: 0.20              # 20% quota ($40 on $200 day)
+      sub_stop_usd: 35.0           # -$35.00 session sub-stop
+      xau_lot_multiplier: 0.50     # 0.25% risk per trade in Asia
+      allowed_symbols: ["XAUUSDm"] # USOILm strictly disabled
+    london:
+      window_utc: ["07:00", "13:00"]
+      quota_pct: 0.35              # 35% quota ($70 on $200 day; cumulative $110 locks until US Open)
+      cumulative_lock_ratio: 0.55  # Lock when cumulative daily PnL >= 55% of weekday target
+      allowed_symbols: ["XAUUSDm"]
+    us:
+      window_utc: ["13:00", "20:00"]
+      quota_pct: 0.45              # 45% quota ($90 on $200 day)
+      allowed_symbols: ["XAUUSDm", "USOILm"]
+      fat_tail_window_utc: ["13:00", "17:00"]
+  friday_hard_flat_utc: "13:00"    # Friday 13:00 UTC (20:00 VN) Hard Flat Invariant
+  fat_tail_override_enabled: true  # Fat-Tail Mode: Override $200 lock ONLY during US Session if OBI >= 0.85 & Vol >= 3x
+  fat_tail_min_ofi: 0.85           # Extreme OBI threshold for Fat-Tail Conviction
+  fat_tail_min_vol_mult: 3.0       # Volume >= 3x SMA20
+  fat_tail_session_utc: ["13:00", "17:00"] # Peak US Liquidity Window
+  stagnation_timeout_minutes: 45   # Trailing-Tighten Time-Barrier: 45m stagnation (3 M15 bars)
+  warning_drawdown_pct: 0.015      # 1.5% warning trigger
   min_margin_level_percent: 300.0  # Stop trading if margin level drops below 300%
-  max_total_open_positions: 6      # Global concurrent position limit across all assets
+  max_total_open_positions: 4      # Focused capacity on champion assets
   max_positions_per_symbol: 1      # Max 1 concurrent position per asset
   rollover_curfew_utc: ["21:45", "22:30"]  # Exness daily rollover spread freeze
+  macro_news_window_utc: ["14:15", "14:45"] # Lá chắn tin vĩ mô 14:30 UTC: Chặn mở lệnh mới trên USD-sensitive assets
+  macro_news_symbols: ["XAUUSDm", "US30m", "USOILm", "GBPUSDm"]
   post_sl_cooldown_seconds: 300    # Base Cooldown (5 phút)
   max_daily_loss_per_symbol_usd: 80.0      # Hạn mức chịu lỗ tối đa cho từng Symbol ($80/ngày)
   consecutive_loss_cooldowns: [300, 2700, -1] # Cooldown lũy tiến: 5m -> 45m -> Khóa symbol hết ngày
@@ -46,17 +79,19 @@ risk_desk:
     tier1_lock_ratio: 0.25         # Khóa +25% TP distance làm lợi nhuận chắc chắn
     tier2_trigger_ratio: 0.75      # Khi lãi đạt 75% TP distance
     tier2_lock_ratio: 0.50         # Khóa +50% TP distance
-  max_holding_bars_m15: 5          # Nautilus Alpha Decay Time-Barrier (Nới rộng lên 75 phút - 5 nến M15 cho lệnh đủ biên độ chạy TP/Trailing)
+  max_holding_bars_m15: 3          # 45m Empirical Stagnation Horizon (3 M15 bars, empirical WR peaks at 52.6%)
 
 symbols:
   # ===================================================================
   # PILLAR 1: Sovereign Crypto Champion (Bitcoin) — Khử nhiễu Order Flow ban đêm & Đa khung
   # ===================================================================
   - name: "BTCUSDm"
-    enabled: true
+    enabled: false                 # DISABLED: High slippage, thin Asian liquidity sweep traps (-$97.45)
     strategy_type: "crypto"
     magic: 777004
     timeframe: "M15"
+    trading_session_utc: ["12:00", "22:00"] # Khóa phiên Á (00:00-12:00 UTC) thanh khoản mỏng, chỉ giao dịch phiên Âu-Mỹ
+    max_spread_to_atr_ratio: 0.12           # Chặn vào lệnh khi spread vượt quá 12% ATR14 M15 (tránh quét râu SL)
     max_spread_points: 2500.0      # ~25 USD max spread cap (normal Exness spread is 600 - 1200 pts)
     sl_multiplier: 1.5
     tp_multiplier: 3.2             # Tỷ lệ R:R 1:2.13
@@ -88,17 +123,21 @@ symbols:
   # PILLAR 2: Precious Metal Champion (Gold) — Phiên Âu/Mỹ & Session-Aware ATR
   # ===================================================================
   - name: "XAUUSDm"
-    enabled: true
+    enabled: true                  # CHAMPION ASSET: Net +$302.11, PF 2.13, WR 53.3%
     strategy_type: "gold"
     magic: 777001
     timeframe: "M15"
     max_spread_points: 350.0       # Max allowable spread in points (~35 pips / $0.35)
-    trading_session_utc: ["07:00", "21:00"] # Tier 2: Đứng ngoài phiên Á, chỉ giao dịch phiên Âu - Mỹ
+    trading_session_utc: ["07:00", "21:00"] # Phiên Âu - Mỹ (07:00 - 21:00 UTC)
+    asian_range_window_utc: ["00:00", "07:00"] # Khung quét biên Á để săn thanh khoản
     sl_multiplier: 1.5
-    tp_multiplier: 3.0             # Tỷ lệ R:R 1:2.0
+    baseline_tp_multiplier: 2.0    # 2.0x ATR14 for standard mean-reversion sweeps (Triples Expectancy, MaxDD -$68.55)
+    fat_tail_tp_multiplier: 3.5    # 3.5x ATR14 for Fat-Tail Conviction Mode during US Peak (13:00-17:00 UTC)
+    tp_multiplier: 2.0             # Default to baseline 2.0x
     position_sizing:
-      risk_per_trade_pct: 0.004    # 0.4% risk per trade an toàn
-      max_lot_cap: 0.05            # Khống chế 0.05 lot an toàn cho Vàng (0.01 - 0.02 lot phiên Mỹ)
+      risk_per_trade_pct: 0.005    # Capped at exactly 0.5% Institutional Risk Per Trade
+      max_lot_cap: 0.07            # Capped at 0.07 lot for baseline trades
+      fat_tail_pyramid_lot: 0.02   # Micro-lot pyramid sizing in Fat-Tail Conviction Mode
     avellaneda_stoikov:
       gamma: 0.03                  # CPCV Validated (15.5% Divergence)
       kappa: 0.8
@@ -151,7 +190,7 @@ symbols:
   # PILLAR 4: US Equity Index Champion (Dow Jones 30) — H1 Trend & Pullback Filter
   # ===================================================================
   - name: "US30m"
-    enabled: true
+    enabled: false                 # DISABLED: False breakout whipsaws (-$95.13)
     strategy_type: "index"
     magic: 777006
     timeframe: "M15"
