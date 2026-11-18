@@ -257,6 +257,9 @@ def main():
 
         try:
             loop_start = time.time()
+            now_ts = loop_start
+            now_utc = datetime.now(timezone.utc)
+            now_utc_dt = now_utc
             acc = mt5_bridge.get_account_info()
             if not acc:
                 time.sleep(poll_interval)
