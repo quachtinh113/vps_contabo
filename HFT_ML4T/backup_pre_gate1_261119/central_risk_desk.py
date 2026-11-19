@@ -1,0 +1,707 @@
+"""
+HFT_ML4T — Central Risk Desk (Chief Risk Officer Guard)
+Enforces strict institutional capital preservation rules for real-money trading:
+- Real-time Equity & Daily Drawdown Monitoring (Millennium/Citadel ladder)
+- Rollover Curfew & Spread Widening Protection
+- Leverage & Margin Call Barrier
+- Circuit Breaker / Hard Halt Kill-Switch
+"""
+
+import os
+import time
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, Tuple
+
+from core.audit_logger import get_logger
+
+logger = get_logger()
+
+
+# Correlated Asset Cluster Mapping for Portfolio Diversification Guard
+DEFAULT_ASSET_CLUSTERS: Dict[str, list] = {
+    "METALS": ["XAUUSDm", "XAGUSDm", "XAUUSD", "XAGUSD"],
+    "CRYPTO": ["BTCUSDm", "ETHUSDm", "SOLUSDm", "BTCUSD", "ETHUSD", "SOLUSD"],
+    "COMMODITIES": ["USOILm", "UKOILm", "USOIL", "UKOIL"],
+    "INDICES": ["US30m", "USTECm", "JP225m", "US30", "USTEC", "JP225"],
+    "FX_MAJORS": ["EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm", "USDCADm", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
+}
+
+
+class CentralRiskDesk:
+    """
+    Guards live trading operations against catastrophic losses, broker spread anomalies,
+    excessive correlation concentration, and rollover volatility.
+    """
+
+    def __init__(
+        self,
+        max_daily_drawdown_usd: float = 300.0,
+        max_daily_drawdown_pct: float = 0.05,        # 5% max daily drawdown
+        warning_drawdown_pct: float = 0.025,         # 2.5% warning
+        min_margin_level_percent: float = 300.0,     # Stop trading if margin level < 300%
+        max_total_open_positions: int = 5,
+        max_positions_per_symbol: int = 2,
+        rollover_curfew_utc: Tuple[str, str] = ("21:45", "22:30"),  # Exness daily rollover freeze
+        halt_file: str = "HALT_HFT",
+        post_sl_cooldown_seconds: float = 240.0,
+        max_daily_loss_per_symbol_usd: float = 80.0,
+        consecutive_loss_cooldowns: Tuple[float, ...] = (300.0, 2700.0, -1.0),
+        max_trailing_drawdown_pct: float = 0.08,     # 8% all-time trailing high-water mark drawdown
+        max_positions_per_cluster: int = 2,          # Max 2 concurrent positions per correlated asset cluster
+        cluster_map: Optional[Dict[str, list]] = None,
+        auto_write_halt_file: bool = True,
+        max_acceptable_slippage_points: float = 25.0, # Slippage barrier cap in points
+        max_acceptable_latency_ms: float = 1200.0,    # Execution latency barrier cap in ms
+        macro_news_window_utc: Optional[Tuple[str, str]] = None,
+        macro_news_symbols: Tuple[str, ...] = ("XAUUSDM", "US30M", "USOILM", "GBPUSDM"),
+        hard_daily_target_usd: float = 200.0,
+        fat_tail_override_enabled: bool = True,
+        weekday_targets_usd: Optional[Dict[int, float]] = None,
+        asia_sub_stop_usd: float = 35.0,
+        friday_hard_flat_utc: str = "13:00"
+    ):
+        self.max_daily_drawdown_usd = max_daily_drawdown_usd
+        self.max_daily_drawdown_pct = max_daily_drawdown_pct
+        self.warning_drawdown_pct = warning_drawdown_pct
+        self.min_margin_level_percent = min_margin_level_percent
+        self.max_total_open_positions = max_total_open_positions
+        self.max_positions_per_symbol = max_positions_per_symbol
+        self.rollover_curfew_utc = rollover_curfew_utc
+        self.halt_file = Path(halt_file)
+        self.post_sl_cooldown_seconds = post_sl_cooldown_seconds
+        self.max_daily_loss_per_symbol_usd = max_daily_loss_per_symbol_usd
+        self.consecutive_loss_cooldowns = consecutive_loss_cooldowns
+        self.max_trailing_drawdown_pct = max_trailing_drawdown_pct
+        self.max_positions_per_cluster = max_positions_per_cluster
+        self.cluster_map = cluster_map or DEFAULT_ASSET_CLUSTERS
+        self.auto_write_halt_file = auto_write_halt_file
+        self.max_acceptable_slippage_points = max_acceptable_slippage_points
+        self.max_acceptable_latency_ms = max_acceptable_latency_ms
+        self.macro_news_window_utc = macro_news_window_utc
+        self.macro_news_symbols = {s.upper().replace(".M", "").replace("M", "") + "M" for s in macro_news_symbols}
+        self.hard_daily_target_usd = hard_daily_target_usd
+        self.fat_tail_override_enabled = fat_tail_override_enabled
+        self.weekday_targets_usd = weekday_targets_usd or {
+            0: 150.0,  # Monday ($150)
+            1: 200.0,  # Tuesday ($200)
+            2: 200.0,  # Wednesday ($200)
+            3: 280.0,  # Thursday ($280)
+            4: 170.0   # Friday ($170) -> Total $1,000/week
+        }
+        self.asia_sub_stop_usd = asia_sub_stop_usd
+        self.friday_hard_flat_utc = friday_hard_flat_utc
+
+        self._daily_peak_equity = 0.0
+        self._all_time_peak_equity = 0.0
+        self._current_derisk_tier = 1.0  # Tracks hysteresis state: 1.0 -> 0.75 -> 0.50 -> 0.0
+        self._current_date = ""
+        self._is_halted = False
+        self._halt_reason = ""
+        self._symbol_cooldowns: Dict[str, float] = {}
+        self._consecutive_losses: Dict[str, int] = {}
+        self._daily_symbol_pnl: Dict[str, float] = {}
+        self._asia_realized_pnl = 0.0
+        self._peak_daily_realized_pnl = 0.0
+        self._symbol_locked_for_day: Dict[str, bool] = {}
+        self._symbol_recovery_trades: Dict[str, int] = {}
+        self._execution_history: Dict[str, list] = {}
+
+    def _trigger_emergency_halt(self, reason: str, current_equity: float = 0.0) -> None:
+        """Triggers circuit breaker and persists physical HALT_HFT lockfile."""
+        self._is_halted = True
+        self._halt_reason = reason
+        self._current_derisk_tier = 0.0
+        logger.critical(f"🛑 [EMERGENCY HALT TRIGGERED] {reason}")
+
+        if self.auto_write_halt_file:
+            try:
+                now_str = datetime.now(timezone.utc).isoformat()
+                content = (
+                    f"EMERGENCY_HALT_TRIGGERED_AT: {now_str}\n"
+                    f"EQUITY: ${current_equity:,.2f}\n"
+                    f"REASON: {reason}\n"
+                    f"ACTION_REQUIRED: Inspect risk telemetry and delete this file to unlock.\n"
+                )
+                self.halt_file.write_text(content, encoding="utf-8")
+                logger.critical(f"📁 [KILL-SWITCH CREATED] Persisted physical lockfile: {self.halt_file}")
+            except Exception as e:
+                logger.error(f"Failed to write physical halt file {self.halt_file}: {e}")
+
+    def _get_cluster_for_symbol(self, symbol: str) -> Optional[str]:
+        """Finds correlated asset cluster for a given symbol."""
+        for cluster_name, syms in self.cluster_map.items():
+            if symbol in syms:
+                return cluster_name
+        return None
+
+    def check_and_reset_daily_halt(self) -> bool:
+        """
+        Auto-resets HALT_HFT lockfile on new UTC day ONLY if the halt was caused by Daily Drawdown.
+        Catastrophic halts (Margin Depletion, Trailing Max Drawdown) remain strictly locked.
+        """
+        if not self.halt_file.exists():
+            return True
+
+        try:
+            content = self.halt_file.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.error(f"Failed to read halt file {self.halt_file}: {e}")
+            return False
+
+        # Only auto-clear if breach reason was Daily Drawdown
+        if "Daily Drawdown Hard Limit breached" in content:
+            creation_time = self.halt_file.stat().st_mtime
+            halt_date = datetime.fromtimestamp(creation_time, tz=timezone.utc).date()
+            current_utc_date = datetime.now(timezone.utc).date()
+
+            if current_utc_date > halt_date:
+                try:
+                    self.halt_file.unlink()
+                    self._is_halted = False
+                    self._halt_reason = ""
+                    self._current_derisk_tier = 1.0
+                    logger.info(
+                        f"🌅 [RISK DESK] Auto-cleared Daily Drawdown HALT_HFT for new trading day: {current_utc_date}. "
+                        f"System unhalted and ready for new session."
+                    )
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to auto-remove halt file {self.halt_file}: {e}")
+                    return False
+        return False
+
+    def update_account_state(self, account_info: Dict[str, Any]) -> None:
+        """Tracks daily peak equity & all-time HWM and resets peak & symbol counters on UTC midnight."""
+        self.check_and_reset_daily_halt()
+
+        now_utc = datetime.now(timezone.utc)
+        today_str = now_utc.strftime("%Y-%m-%d")
+
+        current_equity = account_info.get("equity", 0.0)
+        if current_equity > self._all_time_peak_equity:
+            self._all_time_peak_equity = current_equity
+
+        if today_str != self._current_date:
+            self._current_date = today_str
+            self._daily_peak_equity = current_equity
+            self._consecutive_losses.clear()
+            self._daily_symbol_pnl.clear()
+            self._asia_realized_pnl = 0.0
+            self._peak_daily_realized_pnl = 0.0
+            self._symbol_locked_for_day.clear()
+            self._symbol_cooldowns.clear()
+            logger.info(
+                f"[RISK] New UTC day: {today_str}. Daily peak equity reset to ${current_equity:,.2f}. "
+                f"All-time HWM: ${self._all_time_peak_equity:,.2f}."
+            )
+        else:
+            if current_equity > self._daily_peak_equity:
+                self._daily_peak_equity = current_equity
+
+    def get_today_target(self, now_utc: Optional[datetime] = None) -> float:
+        """Returns baseline profit target based on weekday (Mon $150, Tue/Wed $200, Thu $280, Fri $170)."""
+        dt = now_utc or datetime.now(timezone.utc)
+        weekday = dt.weekday()
+        return self.weekday_targets_usd.get(weekday, self.hard_daily_target_usd)
+
+    def get_current_session(self, now_utc: Optional[datetime] = None) -> str:
+        """Identifies active microstructure session: ASIA, LONDON, or US."""
+        dt = now_utc or datetime.now(timezone.utc)
+        cur_hm = dt.strftime("%H:%M")
+        if "00:00" <= cur_hm < "07:00":
+            return "ASIA"
+        elif "07:00" <= cur_hm < "13:00":
+            return "LONDON"
+        elif "13:00" <= cur_hm < "20:00":
+            return "US"
+        else:
+            return "OFF_HOURS"
+
+    def get_session_lot_multiplier(self, symbol: str, now_utc: Optional[datetime] = None) -> float:
+        """Returns lot scaling factor (0.5x in Asia for XAUUSDm, 1.0x in London/US)."""
+        dt = now_utc or datetime.now(timezone.utc)
+        session = self.get_current_session(dt)
+        if session == "ASIA" and "XAU" in symbol.upper():
+            return 0.50  # 0.25% risk per trade in Asia
+        return 1.0
+
+    def get_dynamic_daily_floor(self, now_utc: Optional[datetime] = None) -> float:
+        """
+        Calculates the Inter-Session One-Way Profit Ratchet (Dynamic Daily Floor).
+        - Rule 1 (London Banked Gains Protection): If peak realized PnL reaches >= 50% of today's target
+          (e.g., >= +$100 on a $200 day, or +$110 London quota), ratchets floor to at least 50% of peak gains
+          (min $50.00), preventing the US session from wiping out morning alpha.
+        - Rule 2 (Fat-Tail Runner Ratchet): If peak realized PnL exceeds today's target (e.g., >= +$200),
+          ratchets floor to 75% of target (e.g., +$150.00), locking baseline while hunting upside.
+        """
+        today_target = self.get_today_target(now_utc)
+        peak = self._peak_daily_realized_pnl
+
+        if peak >= today_target:
+            # Rule 2: Lock at least 75% of baseline weekday target
+            return today_target * 0.75
+        elif peak >= (today_target * 0.50):
+            # Rule 1: Lock at least 50% of peak banked gains (minimum $50 floor)
+            return max(peak * 0.50, 50.0)
+
+        return -self.max_daily_drawdown_usd
+
+    def check_pre_trade_safety(
+        self,
+        symbol: str,
+        current_spread_points: float,
+        max_allowed_spread_points: float,
+        open_positions: list,
+        account_info: Dict[str, Any],
+        signal_regime: str = "BASELINE",
+        now_utc: Optional[datetime] = None
+    ) -> Tuple[bool, str]:
+        """
+        Executes pre-flight institutional risk checks before any order is submitted.
+        Returns (is_approved: bool, reason: str).
+        """
+        cur_dt = now_utc or datetime.now(timezone.utc)
+        cur_hm = cur_dt.strftime("%H:%M")
+
+        # 0. Friday Hard Flat Check (13:00 UTC / 20:00 VN)
+        if cur_dt.weekday() == 4 and cur_hm >= self.friday_hard_flat_utc:
+            return False, f"Friday Hard Flat window reached ({cur_hm} >= {self.friday_hard_flat_utc} UTC / 20:00 VN). All trading halted for weekend."
+
+        # 1. Manual Kill-Switch Check (With Auto Daily Reset for prior day Daily DD)
+        self.check_and_reset_daily_halt()
+
+        if self.halt_file.exists():
+            self._is_halted = True
+            self._halt_reason = f"Kill-switch file detected: {self.halt_file.name}"
+            return False, self._halt_reason
+
+        if self._is_halted:
+            return False, f"Risk Desk is HALTED: {self._halt_reason}"
+
+        # 1.2 Three-Session Dynamic Microstructure Gating
+        session = self.get_current_session(cur_dt)
+        daily_realized_pnl = sum(self._daily_symbol_pnl.values())
+        today_target = self.get_today_target(cur_dt)
+
+        if session == "ASIA":
+            if "OIL" in symbol.upper():
+                return False, f"USOILm is disabled during Asia Session (00:00-07:00 UTC). Activated only in US Session (13:00-20:00 UTC)."
+            if self._asia_realized_pnl <= -self.asia_sub_stop_usd:
+                return False, f"Asia Session sub-stop breached (-${abs(self._asia_realized_pnl):.2f} <= -${self.asia_sub_stop_usd:.2f}). Paused until London Open (07:00 UTC)."
+        elif session == "LONDON":
+            if "OIL" in symbol.upper():
+                return False, f"USOILm is disabled during London Session (07:00-13:00 UTC). Activated only in US Session (13:00-20:00 UTC)."
+            # London cumulative quota lock (55% of weekday target, e.g. +$110 on $200 day)
+            london_lock_threshold = today_target * 0.55
+            if daily_realized_pnl >= london_lock_threshold:
+                return False, f"London/Asia quota reached (+${daily_realized_pnl:.2f} >= +${london_lock_threshold:.2f}). Paused until US Open (13:00 UTC) to bank morning alpha."
+
+        # 1.25 Inter-Session One-Way Profit Ratchet (Dynamic Daily Floor)
+        dynamic_floor = self.get_dynamic_daily_floor(cur_dt)
+        if self._peak_daily_realized_pnl >= (today_target * 0.50):
+            if daily_realized_pnl <= dynamic_floor:
+                return False, (
+                    f"Inter-Session Profit Ratchet active: Daily Realized PnL (+${daily_realized_pnl:,.2f}) dropped "
+                    f"to/below Dynamic Daily Floor (+${dynamic_floor:,.2f}) from peak (+${self._peak_daily_realized_pnl:,.2f}). "
+                    f"Trading halted for remainder of day to lock in banked morning/session alpha."
+                )
+
+        # 1.5 Per-Symbol Isolation Circuit Breaker (Daily loss cap & consecutive losses)
+        if self._symbol_locked_for_day.get(symbol, False):
+            return False, f"Symbol {symbol} is locked for remainder of day (Loss cap or consecutive losses breached)"
+
+        sym_pnl = self._daily_symbol_pnl.get(symbol, 0.0)
+        if sym_pnl <= -self.max_daily_loss_per_symbol_usd:
+            self._symbol_locked_for_day[symbol] = True
+            return False, f"Symbol {symbol} breached daily loss cap (-${abs(sym_pnl):.2f} >= ${self.max_daily_loss_per_symbol_usd:.2f})"
+
+        # 1.8 Dual-Mode Realized Daily Target & Hard Drawdown Guard
+        current_equity = account_info.get("equity", 0.0)
+
+        if daily_realized_pnl <= -self.max_daily_drawdown_usd:
+            reason = f"Daily Loss Hard Stop triggered: Realized PnL -${abs(daily_realized_pnl):,.2f} <= -${self.max_daily_drawdown_usd:,.2f}"
+            self._trigger_emergency_halt(reason, current_equity)
+            return False, reason
+
+        if daily_realized_pnl >= today_target:
+            is_us_session = ("13:00" <= cur_hm <= "17:00")
+            if self.fat_tail_override_enabled and signal_regime == "FAT_TAIL" and is_us_session:
+                logger.info(
+                    f"🚀 [FAT-TAIL CONVICTION OVERRIDE] Daily target reached (+${daily_realized_pnl:,.2f} >= ${today_target:,.2f}), "
+                    f"but FAT_TAIL conviction signal detected during US Session! Bypassing ${today_target:.0f} lock for asymmetric upside."
+                )
+            else:
+                return False, (
+                    f"Daily Profit Target Reached (+${daily_realized_pnl:,.2f} >= ${today_target:,.2f}). "
+                    f"Hard Daily Target Lock active to bank baseline profits."
+                )
+
+        # 2. Daily Drawdown Guard
+        if self._daily_peak_equity > 0:
+            dd_usd = self._daily_peak_equity - current_equity
+            dd_pct = dd_usd / self._daily_peak_equity
+
+            if dd_usd >= self.max_daily_drawdown_usd or dd_pct >= self.max_daily_drawdown_pct:
+                reason = (
+                    f"Daily Drawdown Hard Limit breached: -${dd_usd:,.2f} (-{dd_pct*100:.2f}%) "
+                    f"vs Limit: ${self.max_daily_drawdown_usd:,.2f} / {self.max_daily_drawdown_pct*100:.1f}%"
+                )
+                self._trigger_emergency_halt(reason, current_equity)
+                return False, reason
+
+            if dd_pct >= self.warning_drawdown_pct:
+                logger.warning(
+                    f"[RISK WARNING] Approaching daily drawdown ceiling: -${dd_usd:,.2f} (-{dd_pct*100:.2f}%)"
+                )
+
+        # 2.5 All-Time Trailing High-Water Mark Drawdown Guard
+        if self._all_time_peak_equity > 0:
+            trailing_dd_pct = max(0.0, (self._all_time_peak_equity - current_equity) / self._all_time_peak_equity)
+            if trailing_dd_pct >= self.max_trailing_drawdown_pct:
+                reason = (
+                    f"All-Time Trailing Drawdown Hard Limit breached: -{trailing_dd_pct*100:.2f}% "
+                    f"(Peak: ${self._all_time_peak_equity:,.2f}, Equity: ${current_equity:,.2f}) "
+                    f"vs Limit: {self.max_trailing_drawdown_pct*100:.1f}%"
+                )
+                self._trigger_emergency_halt(reason, current_equity)
+                return False, reason
+
+        # 3. Margin Level Guard
+        margin_level = account_info.get("margin_level", 0.0)
+        margin = account_info.get("margin", 0.0)
+        if margin > 0 and margin_level > 0:
+            if margin_level < 150.0:  # Severe emergency margin depletion
+                reason = f"Emergency Margin Depletion: Margin level {margin_level:.1f}% < 150.0% critical barrier."
+                self._trigger_emergency_halt(reason, current_equity)
+                return False, reason
+            if margin_level < self.min_margin_level_percent:
+                return False, f"Margin level {margin_level:.1f}% < safe minimum {self.min_margin_level_percent}%"
+
+        # 4. Rollover Curfew Check (Avoid severe Exness spread spikes 21:45-22:30 UTC)
+        cur_dt = now_utc or datetime.now(timezone.utc)
+        current_time_str = cur_dt.strftime("%H:%M")
+        start_curfew, end_curfew = self.rollover_curfew_utc
+        if start_curfew <= current_time_str <= end_curfew:
+            return False, f"Rollover Curfew Active ({start_curfew} - {end_curfew} UTC). Spread risk elevated."
+
+        # 4.5 Macro News Release Window Guard (14:15 - 14:45 UTC)
+        # Blocks new entries on USD/macro sensitive assets during major US economic releases (e.g., NFP, CPI)
+        if self.macro_news_window_utc:
+            start_news, end_news = self.macro_news_window_utc
+            sym_clean = symbol.upper().replace(".M", "").replace("M", "") + "M"
+            if (symbol.upper() in self.macro_news_symbols or sym_clean in self.macro_news_symbols) and (start_news <= current_time_str <= end_news):
+                return False, f"Macro News Release Window Active ({start_news} - {end_news} UTC). New {symbol} orders blocked for event risk."
+
+        # 5. Live Spread Guard
+        if current_spread_points > max_allowed_spread_points:
+            return False, (
+                f"Current spread ({current_spread_points:.1f} pts) exceeds maximum threshold "
+                f"({max_allowed_spread_points:.1f} pts) for {symbol}"
+            )
+
+        # 5.5 Post-SL Cooldown Guard (Eliminates Flip-flop Whipsaw)
+        cooldown_expiry = self._symbol_cooldowns.get(symbol, 0.0)
+        remaining = cooldown_expiry - time.time()
+        if remaining > 0:
+            return False, f"Post-SL Cooldown active for {symbol} ({remaining:.0f}s remaining). Whipsaw protection."
+
+        # 6. Position Count Constraints
+        if len(open_positions) >= self.max_total_open_positions:
+            return False, f"Total open positions ({len(open_positions)}) reached limit ({self.max_total_open_positions})"
+
+        sym_positions = [
+            p for p in open_positions
+            if getattr(p, "symbol", None) == symbol or (isinstance(p, dict) and p.get("symbol") == symbol)
+        ]
+        if len(sym_positions) >= self.max_positions_per_symbol:
+            return False, f"Symbol {symbol} open positions ({len(sym_positions)}) reached limit ({self.max_positions_per_symbol})"
+
+        # 6.5 Asset Cluster Correlation Barrier
+        target_cluster = self._get_cluster_for_symbol(symbol)
+        if target_cluster:
+            cluster_positions_count = 0
+            for p in open_positions:
+                p_sym = getattr(p, "symbol", None) or (p.get("symbol") if isinstance(p, dict) else "")
+                if p_sym and self._get_cluster_for_symbol(p_sym) == target_cluster:
+                    cluster_positions_count += 1
+
+            if cluster_positions_count >= self.max_positions_per_cluster:
+                return False, (
+                    f"Asset Cluster Correlation Barrier: Cluster '{target_cluster}' has "
+                    f"{cluster_positions_count}/{self.max_positions_per_cluster} open positions. "
+                    f"Suppressing new {symbol} order to prevent concentration risk."
+                )
+
+        return True, "APPROVED"
+
+    def record_trade_result(self, symbol: str, profit: float, comment: str = "") -> None:
+        """
+        Institutional trade result audit:
+        - Tracks per-symbol PnL and consecutive loss streaks
+        - Enforces exponential backoff cooldown ladder (5m -> 45m -> Day Lockout)
+        - Enforces per-symbol daily loss limit isolation
+        """
+        self._daily_symbol_pnl[symbol] = self._daily_symbol_pnl.get(symbol, 0.0) + profit
+        sym_pnl = self._daily_symbol_pnl[symbol]
+
+        # Update Asia session sub-pnl
+        cur_dt = datetime.now(timezone.utc)
+        if self.get_current_session(cur_dt) == "ASIA":
+            self._asia_realized_pnl += profit
+
+        # Update Daily Peak Realized PnL for One-Way Profit Ratchet
+        daily_realized_pnl = sum(self._daily_symbol_pnl.values())
+        if daily_realized_pnl > self._peak_daily_realized_pnl:
+            self._peak_daily_realized_pnl = daily_realized_pnl
+
+        if profit >= 0:
+            self._consecutive_losses[symbol] = 0
+            logger.info(
+                f"🏆 [RISK AUDIT] {symbol} trade WON: +${profit:,.2f} | "
+                f"Streak reset to 0 | Daily PnL: ${sym_pnl:+,.2f}"
+            )
+        else:
+            loss_streak = self._consecutive_losses.get(symbol, 0) + 1
+            self._consecutive_losses[symbol] = loss_streak
+            logger.warning(
+                f"⚠️ [RISK AUDIT] {symbol} trade LOST: -${abs(profit):,.2f} ({comment}) | "
+                f"Loss Streak: {loss_streak} | Daily PnL: ${sym_pnl:+,.2f}"
+            )
+
+            # Check if breached per-symbol daily loss cap
+            if sym_pnl <= -self.max_daily_loss_per_symbol_usd:
+                self._symbol_locked_for_day[symbol] = True
+                logger.critical(
+                    f"🛑 [SYMBOL LOCKOUT] {symbol} locked for rest of UTC day: "
+                    f"Daily loss ${sym_pnl:+,.2f} breached cap -${self.max_daily_loss_per_symbol_usd:,.2f}"
+                )
+                return
+
+            # Exponential backoff cooldown ladder: [300s (5m), 2700s (45m), 24h Pod Lockout]
+            if loss_streak == 1:
+                dur = self.consecutive_loss_cooldowns[0] if len(self.consecutive_loss_cooldowns) > 0 else 300.0
+                self.trigger_cooldown(symbol, duration_sec=dur, reason=f"Loss #1 on {symbol}")
+            elif loss_streak == 2:
+                dur = self.consecutive_loss_cooldowns[1] if len(self.consecutive_loss_cooldowns) > 1 else 2700.0
+                self.trigger_cooldown(symbol, duration_sec=dur, reason=f"Loss #2 consecutive on {symbol} (Deep Backoff 45m)")
+            else:
+                # Tier 1 Pod Drawdown: 24h Lockout + 5 recovery trades at 50% lot
+                self._symbol_recovery_trades[symbol] = 5
+                dur_24h = 86400.0  # 24 hours
+                self.trigger_cooldown(symbol, duration_sec=dur_24h, reason=f"Loss #{loss_streak} consecutive on {symbol} (Tier 1 Pod 24h Lockout)")
+                logger.critical(
+                    f"🛑 [TIER 1 POD LOCKOUT] {symbol} locked for 24 hours after {loss_streak} consecutive losses. "
+                    f"Pod Recovery Mode activated (next 5 trades at 50% lot size)."
+                )
+
+    def get_symbol_risk_multiplier(self, symbol: str) -> float:
+        """Returns sizing multiplier for symbol-specific Pod Recovery mode (0.50 if recovering)."""
+        if self._symbol_recovery_trades.get(symbol, 0) > 0:
+            return 0.50
+        return 1.0
+
+    def consume_recovery_trade(self, symbol: str) -> None:
+        """Decrements recovery trade counter when an order is opened."""
+        if symbol in self._symbol_recovery_trades and self._symbol_recovery_trades[symbol] > 0:
+            self._symbol_recovery_trades[symbol] -= 1
+            logger.info(
+                f"🛡️ [POD RECOVERY] {symbol} order dispatched at 50% sizing. "
+                f"Remaining recovery trades: {self._symbol_recovery_trades[symbol]}"
+            )
+
+    def record_execution_metric(self, symbol: str, latency_ms: float, slippage_points: float) -> None:
+        """
+        Monitors execution quality and triggers safety cooldowns if broker
+        slippage or network latency breaches acceptable institutional thresholds.
+        """
+        if symbol not in self._execution_history:
+            self._execution_history[symbol] = []
+
+        self._execution_history[symbol].append({
+            "time": time.time(),
+            "latency_ms": latency_ms,
+            "slippage_points": slippage_points
+        })
+        if len(self._execution_history[symbol]) > 50:
+            self._execution_history[symbol].pop(0)
+
+        # Slippage barrier breach: adverse slippage >= max_acceptable_slippage_points
+        if slippage_points >= self.max_acceptable_slippage_points:
+            cooldown_dur = 90.0
+            reason = f"Severe Adverse Slippage ({slippage_points:+.1f} pts >= {self.max_acceptable_slippage_points:.1f} pts)"
+            logger.warning(f"⚠️ [SLIPPAGE BARRIER BREACHED] {symbol}: {reason}. Pausing quoting for {cooldown_dur:.0f}s.")
+            self.trigger_cooldown(symbol, duration_sec=cooldown_dur, reason=reason)
+
+        # Latency barrier breach: execution latency >= max_acceptable_latency_ms
+        elif latency_ms >= self.max_acceptable_latency_ms:
+            cooldown_dur = 60.0
+            reason = f"Severe Broker Latency ({latency_ms:.0f}ms >= {self.max_acceptable_latency_ms:.0f}ms)"
+            logger.warning(f"⚠️ [LATENCY BARRIER BREACHED] {symbol}: {reason}. Pausing quoting for {cooldown_dur:.0f}s.")
+            self.trigger_cooldown(symbol, duration_sec=cooldown_dur, reason=reason)
+
+    def get_execution_stats(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """Calculates rolling average latency and slippage across symbols."""
+        if symbol:
+            history = self._execution_history.get(symbol, [])
+        else:
+            history = [entry for entries in self._execution_history.values() for entry in entries]
+
+        if not history:
+            return {"sample_count": 0, "avg_latency_ms": 0.0, "avg_slippage_points": 0.0}
+
+        avg_lat = sum(e["latency_ms"] for e in history) / len(history)
+        avg_slip = sum(e["slippage_points"] for e in history) / len(history)
+        return {
+            "sample_count": len(history),
+            "avg_latency_ms": round(avg_lat, 2),
+            "avg_slippage_points": round(avg_slip, 2)
+        }
+
+    def get_risk_multiplier(self, current_equity: float) -> float:
+        """
+        Nautilus Trader Drawdown Ladder De-Risking with Asymmetric Hysteresis Recovery:
+        - Escalation into deeper risk reduction is immediate to protect capital.
+        - Recovery back to higher sizing requires equity to surpass a safety buffer (hysteresis),
+          preventing rapid oscillation (chattering) around boundary thresholds:
+            * DD >= 5.0% or Halted: 0.0
+            * DD >= 4.0%: 0.50 (Survival mode)
+            * DD >= 2.5%: 0.75 (Tier 1 de-risking)
+            * Recovery from 0.50 -> 0.75 requires DD < 3.0% (1.0% buffer)
+            * Recovery from 0.75 -> 1.00 requires DD < 1.5% (1.0% buffer)
+        """
+        if self._daily_peak_equity <= 0:
+            return 1.0
+        if self._is_halted:
+            self._current_derisk_tier = 0.0
+            return 0.0
+
+        dd_pct = max(0.0, (self._daily_peak_equity - current_equity) / self._daily_peak_equity)
+
+        # 1. Hard Halt
+        if dd_pct >= self.max_daily_drawdown_pct:
+            self._current_derisk_tier = 0.0
+            return 0.0
+
+        # 2. Deep Survival Derisking
+        if dd_pct >= 0.040:
+            self._current_derisk_tier = 0.50
+            return 0.50
+
+        # 3. If currently in Survival Tier 0.50, hold until DD drops below 3.0% recovery buffer
+        if self._current_derisk_tier == 0.50:
+            if dd_pct < 0.030:
+                self._current_derisk_tier = 0.75
+            return self._current_derisk_tier
+
+        # 4. Standard Tier 1 Derisking
+        if dd_pct >= self.warning_drawdown_pct:
+            self._current_derisk_tier = 0.75
+            return 0.75
+
+        # 5. If currently in Tier 0.75, hold until DD drops below 1.5% recovery buffer
+        if self._current_derisk_tier <= 0.75:
+            if dd_pct < 0.015:
+                self._current_derisk_tier = 1.0
+            return self._current_derisk_tier
+
+        self._current_derisk_tier = 1.0
+        return 1.0
+
+    def trigger_cooldown(self, symbol: str, duration_sec: Optional[float] = None, reason: str = "") -> None:
+        """Puts a symbol into a temporary cooldown after a loss / stop-loss to eliminate whipsaws."""
+        dur = duration_sec if duration_sec is not None else self.post_sl_cooldown_seconds
+        if dur > 0:
+            if not hasattr(self, "_cooldown_reasons"):
+                self._cooldown_reasons: Dict[str, str] = {}
+            self._symbol_cooldowns[symbol] = time.time() + dur
+            self._cooldown_reasons[symbol] = reason
+            logger.info(f"⏳ [RISK COOLDOWN] {symbol} locked for {dur:.0f}s ({reason}) to protect capital.")
+
+    def is_in_cooldown(self, symbol: str) -> bool:
+        """Checks if symbol is currently in an active cooldown window."""
+        return time.time() < self._symbol_cooldowns.get(symbol, 0.0)
+
+    def get_cooldown_reason(self, symbol: str) -> str:
+        """Returns the logged reason for the active cooldown if available."""
+        if not hasattr(self, "_cooldown_reasons"):
+            self._cooldown_reasons: Dict[str, str] = {}
+        return self._cooldown_reasons.get(symbol, "Active Cooldown")
+
+    def manual_unlock(self) -> None:
+        """Clears halted state if kill-switch file is deleted."""
+        if self.halt_file.exists():
+            try:
+                self.halt_file.unlink()
+            except Exception as e:
+                logger.error(f"Failed to delete halt file: {e}")
+        self._is_halted = False
+        self._halt_reason = ""
+        self._current_derisk_tier = 1.0
+        self._symbol_cooldowns.clear()
+        self._consecutive_losses.clear()
+        self._daily_symbol_pnl.clear()
+        self._asia_realized_pnl = 0.0
+        self._peak_daily_realized_pnl = 0.0
+        self._symbol_locked_for_day.clear()
+        logger.info("[RISK] Central Risk Desk manually unlocked.")
+
+    def is_macro_news_window(self, now_utc: Optional[datetime] = None) -> bool:
+        """Returns True if current time is within US macro data release window (14:15 - 14:45 UTC)."""
+        if not self.macro_news_window_utc:
+            return False
+        dt = now_utc or datetime.now(timezone.utc)
+        hm = dt.strftime("%H:%M")
+        start_news, end_news = self.macro_news_window_utc
+        return start_news <= hm <= end_news
+
+    def is_friday_hard_flat_time(self, now_utc: Optional[datetime] = None) -> bool:
+        """Returns True if current time is Friday at or after friday_hard_flat_utc (13:00 UTC / 20:00 VN)."""
+        dt = now_utc or datetime.now(timezone.utc)
+        return dt.weekday() == 4 and dt.strftime("%H:%M") >= self.friday_hard_flat_utc
+
+    def evaluate_conditional_time_barrier(
+        self,
+        symbol: str,
+        pos_type: int,
+        pos_age_sec: float,
+        price_open: float,
+        price_current: float,
+        initial_sl: float,
+        base_horizon_sec: float = 4500.0,
+        extended_horizon_sec: float = 6300.0,
+        h1_trend_bullish: Optional[bool] = None,
+        m15_ofi: Optional[float] = None
+    ) -> Tuple[bool, str]:
+        """
+        Evaluates whether an aging position at 75m should be extended by 30m (up to 105m)
+        or closed immediately.
+        Returns (should_close: bool, reason: str).
+        """
+        if pos_age_sec < base_horizon_sec:
+            return False, "WITHIN_BASE_HORIZON"
+
+        if pos_age_sec >= extended_horizon_sec:
+            return True, f"MAX_EXTENDED_HORIZON_REACHED ({pos_age_sec/60:.1f}m >= {extended_horizon_sec/60:.0f}m)"
+
+        profit_dist = (price_current - price_open) if pos_type == 0 else (price_open - price_current)
+        sl_dist = abs(price_open - initial_sl) if initial_sl > 0 else 0.0
+        r_mult = (profit_dist / sl_dist) if sl_dist > 0 else 0.0
+
+        # Slight drawdown (-0.35R <= r_mult <= 0.05R)
+        is_slight_drawdown = (-0.35 <= r_mult <= 0.05)
+
+        trend_aligned = False
+        if pos_type == 0:  # BUY
+            h1_ok = (h1_trend_bullish is True) or (h1_trend_bullish is None)
+            ofi_ok = (m15_ofi is None) or (m15_ofi >= 0.0)
+            trend_aligned = h1_ok and ofi_ok
+        elif pos_type == 1:  # SELL
+            h1_ok = (h1_trend_bullish is False) or (h1_trend_bullish is None)
+            ofi_ok = (m15_ofi is None) or (m15_ofi <= 0.0)
+            trend_aligned = h1_ok and ofi_ok
+
+        if is_slight_drawdown and trend_aligned:
+            return False, f"EXTENDED_HORIZON: Slight drawdown ({r_mult:+.2f}R), H1 trend and OFI aligned. Horizon extended to 105m."
+        else:
+            return True, f"ALPHA_DECAY_EXIT: R-mult={r_mult:+.2f}R, trend_aligned={trend_aligned}"

@@ -164,7 +164,7 @@ symbols:
     magic: 777005
     timeframe: "M15"
     max_spread_points: 35.0        # Max allowable spread in points (~0.035$, normal spread is 20 pts)
-    trading_session_utc: ["07:00", "20:00"]  # Chặn phiên Á (00:00-05:00 UTC) thanh khoản mỏng
+    trading_session_utc: ["13:00", "21:00"]  # NY Pit 08:00-16:00 America/New_York (US Liquid Hours Only)
     friday_hard_close_utc: "20:30"           # Bắt buộc đóng toàn bộ lệnh trước khi đóng cửa tuần
     min_sl_distance_pct: 0.0035              # Sàn bảo vệ tối thiểu 0.35% giá đối với USOILm chống quét nhiễu < 15m
     sl_multiplier: 2.2             # Nới từ 1.5 lên 2.2 ATR14 (chống whipsaw khung 5-15m)

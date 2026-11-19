@@ -1,8 +1,9 @@
 """
 ========================================================================================
-HFT_ML4T — MASTER PRODUCTION RUNNER
-Institutional High-Frequency Trading & Market Microstructure System.
-Supports Real-Money Live Trading with Central Risk Desk (CRO) Protection.
+HFT_ML4T — GATE 1 DECOUPLED MASTER PRODUCTION RUNNER (v2.0)
+Architecture: Data Tier -> Strategy Tier -> Execution/Risk Tier
+Timezone: zoneinfo (America/New_York, Europe/London, calibrated UTC)
+Mutex: OS-level Exclusive File Lock (quant_bot.lock)
 ========================================================================================
 """
 
@@ -11,6 +12,7 @@ import sys
 import time
 import signal
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -19,7 +21,6 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-from datetime import datetime, timezone
 import yaml
 import pandas as pd
 from dotenv import load_dotenv
@@ -30,14 +31,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from core.audit_logger import setup_logger, get_logger, log_trade_audit, flush_execution_audit
-from core.central_risk_desk import CentralRiskDesk
 from core.mt5_bridge import MT5Bridge
-from strategies.gold_micro_scalper import GoldMicroScalperStrategy
-from strategies.fx_micro_arbitrage import FXMicroArbitrageStrategy
-from strategies.crypto_micro_scalper import CryptoMicroScalperStrategy
-from strategies.commodity_oil_scalper import OilMicroScalperStrategy
-from strategies.index_micro_scalper import IndexMicroScalperStrategy
-from engines.ml4t_data_pipeline import ParquetFeatureCollector
+
+from timezone_dst import ZoneinfoSessionManager, ZoneinfoNewsShield, get_calibrated_utc, format_real_utc_log
+from data_layer import MarketDataIngestion
+from strategy_layer import GoldAlphaEngine, OilAlphaEngine
+from execution_risk_layer import DecoupledExecutionRiskManager
 
 # Load environment & config
 load_dotenv(_ROOT / ".env")
@@ -51,14 +50,13 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 
 system_cfg = config.get("system", {})
 risk_cfg = config.get("risk_desk", {})
-symbols_cfg = config.get("symbols", [])
 
 logger = setup_logger(
     log_dir=str(_ROOT / system_cfg.get("log_dir", "logs")),
     log_level=system_cfg.get("log_level", "INFO")
 )
 
-# OS-Level Process Mutex Lock (quant_bot.lock) to eliminate multi-threaded/duplicate process race conditions
+# OS-Level Process Mutex Lock (quant_bot.lock)
 LOCK_FILE = _ROOT / "quant_bot.lock"
 _lock_handle = None
 
@@ -77,7 +75,7 @@ def acquire_process_lock():
         return True
     except (IOError, OSError) as e:
         logger.critical(f"🛑 [MUTEX ERROR] Another bot instance is already running! Mutex lock failed: {e}")
-        print(f"🛑 [FATAL] Another bot instance is already holding {LOCK_FILE.name}. Exiting to prevent double-fills.")
+        print(f"🛑 [FATAL] Another bot instance is already holding {LOCK_FILE.name}. Exiting.")
         sys.exit(1)
 
 def release_process_lock():
@@ -99,427 +97,136 @@ def release_process_lock():
 
 _running = True
 
-
-def _handle_exit(sig, frame):
+def signal_handler(signum, frame):
     global _running
-    logger.info("🛑 Exit signal received. Safely stopping HFT_ML4T...")
+    logger.info("⚠️ Received shutdown signal. Initiating graceful shutdown...")
     _running = False
 
-
-signal.signal(signal.SIGINT, _handle_exit)
-signal.signal(signal.SIGTERM, _handle_exit)
-
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 def main():
     global _running
     acquire_process_lock()
 
-    live_trading_env = os.getenv("LIVE_TRADING", "false").lower() in ("true", "1", "yes")
+    logger.info("=" * 80)
+    logger.info("🚀 [HFT_ML4T] INITIALIZING GATE 1 PRODUCTION ENGINE (v2.0 DECOUPLED)")
+    logger.info("=" * 80)
 
-    print("\n" + "=" * 78)
-    print("  🚀 HFT_ML4T — PRODUCTION TRADING SYSTEM")
-    print("  Algorithm: Avellaneda-Stoikov Microstructure & OFI + ML4T Gatekeeper")
-    if live_trading_env:
-        print("  ⚠️  EXECUTION MODE: 🔴 LIVE TRADING (TIỀN THẬT / REAL MONEY)")
-    else:
-        print("  ℹ️  EXECUTION MODE: 🟡 PAPER / SHADOW DRY-RUN (An toàn không rủi ro)")
-    print("=" * 78 + "\n")
-
-    # 1. Initialize MT5 Bridge
+    # Initialize MT5 Bridge
     mt5_bridge = MT5Bridge(
         terminal_path=os.getenv("MT5_PATH", ""),
         account=int(os.getenv("MT5_ACCOUNT", "0")),
         password=os.getenv("MT5_PASSWORD", ""),
         server=os.getenv("MT5_SERVER", "")
     )
-
     if not mt5_bridge.initialize():
-        logger.error("Failed to connect to MetaTrader 5. Please verify MT5 is installed and credentials in .env are correct.")
+        logger.critical("🛑 [HFT_ML4T] Failed to initialize MT5 Gateway. Aborting.")
+        release_process_lock()
         sys.exit(1)
 
-    acc = mt5_bridge.get_account_info()
-    if not acc:
-        logger.error("Could not fetch account information.")
-        sys.exit(1)
+    # Log Timezone and NTP Skew Calibration
+    real_utc = get_calibrated_utc()
+    logger.info(f"⏱️ [TIME ENGINE] Real UTC Clock initialized: {format_real_utc_log(real_utc)}")
+    session_mgr = ZoneinfoSessionManager()
+    news_shield = ZoneinfoNewsShield()
+    logger.info(f"🛡️ [NEWS SHIELD] Zoneinfo Macro News Shield: ACTIVE (EIA, CPI, NFP, FOMC auto-gated)")
+    is_dst, dst_desc = session_mgr.is_dst_transition_week(real_utc)
+    logger.info(f"🌐 [DST STATUS] {dst_desc}")
 
-    # Ensure symbols are visible in Market Watch (resilience against broker maintenance/holidays)
-    enabled_symbols = [s.get("name") for s in symbols_cfg if s.get("enabled", False)]
-    mt5_bridge.ensure_symbols_visible(enabled_symbols)
-
-    # 2. Real Account Verification Warning
-    is_real = acc.get("is_real", False)
-    if is_real and live_trading_env:
-        logger.critical(
-            f"🚨 CONFIRMED LIVE REAL ACCOUNT (#{acc['login']} on {acc['server']}). "
-            f"REAL FUNDS AT RISK: Balance ${acc['balance']:,.2f} | Equity ${acc['equity']:,.2f}"
-        )
-    elif live_trading_env and not is_real:
-        logger.warning(
-            f"ℹ️ LIVE_TRADING is true, but connected account #{acc['login']} is DEMO/TRIAL. Orders will be demo."
-        )
-
-    # 3. Initialize Central Risk Desk
-    risk_desk = CentralRiskDesk(
-        max_daily_drawdown_usd=risk_cfg.get("max_daily_drawdown_usd", 300.0),
-        max_daily_drawdown_pct=risk_cfg.get("max_daily_drawdown_pct", 0.05),
-        warning_drawdown_pct=risk_cfg.get("warning_drawdown_pct", 0.025),
-        min_margin_level_percent=risk_cfg.get("min_margin_level_percent", 300.0),
-        max_total_open_positions=risk_cfg.get("max_total_open_positions", 4),
-        max_positions_per_symbol=risk_cfg.get("max_positions_per_symbol", 1),
-        rollover_curfew_utc=tuple(risk_cfg.get("rollover_curfew_utc", ["21:45", "22:30"])),
-        halt_file=str(_ROOT / "HALT_HFT"),
-        post_sl_cooldown_seconds=risk_cfg.get("post_sl_cooldown_seconds", 300.0),
-        max_daily_loss_per_symbol_usd=risk_cfg.get("max_daily_loss_per_symbol_usd", 80.0),
-        consecutive_loss_cooldowns=tuple(risk_cfg.get("consecutive_loss_cooldowns", [300, 2700, -1])),
-        max_trailing_drawdown_pct=risk_cfg.get("max_trailing_drawdown_pct", 0.08),
-        max_positions_per_cluster=risk_cfg.get("max_positions_per_cluster", 2),
-        auto_write_halt_file=risk_cfg.get("auto_write_halt_file", True),
-        macro_news_window_utc=tuple(risk_cfg.get("macro_news_window_utc", ["14:15", "14:45"])),
-        macro_news_symbols=tuple(risk_cfg.get("macro_news_symbols", ["XAUUSDm", "US30m", "USOILm", "GBPUSDm"])),
-        hard_daily_target_usd=float(risk_cfg.get("hard_daily_target_usd", 200.0)),
-        fat_tail_override_enabled=bool(risk_cfg.get("fat_tail_override_enabled", True))
-    )
-    risk_desk.update_account_state(acc)
-
-    # 4. Instantiate Strategies
-    strategies = {}
-    for s_cfg in symbols_cfg:
-        if not s_cfg.get("enabled", False):
-            continue
-        sym = s_cfg.get("name")
-        stype = s_cfg.get("strategy_type", "fx")
-        if stype == "gold":
-            strategies[sym] = GoldMicroScalperStrategy(s_cfg)
-        elif stype == "crypto":
-            strategies[sym] = CryptoMicroScalperStrategy(s_cfg)
-        elif stype == "oil":
-            strategies[sym] = OilMicroScalperStrategy(s_cfg)
-        elif stype == "index":
-            strategies[sym] = IndexMicroScalperStrategy(s_cfg)
-        else:
-            strategies[sym] = FXMicroArbitrageStrategy(s_cfg)
-        logger.info(f"Loaded Strategy [{stype.upper()}] for {sym} (Magic: {s_cfg.get('magic')})")
-
-    # 4.5 Machine Learning Parquet Feature Collector
-    feature_collector = ParquetFeatureCollector(
-        output_dir=str(_ROOT / "data" / "features"),
-        flush_threshold=100
+    # Initialize Decoupled Architecture Tiers
+    data_ingestion = MarketDataIngestion()
+    strategy_gold = GoldAlphaEngine()
+    strategy_oil = OilAlphaEngine()
+    execution_manager = DecoupledExecutionRiskManager(
+        risk_per_trade_pct=risk_cfg.get("risk_per_trade_pct", 0.005),
+        max_lot_caps={"XAUUSDm": 0.07, "USOILm": 0.05},
+        max_daily_drawdown_usd=risk_cfg.get("max_daily_drawdown_usd", 100.0)
     )
 
-    poll_interval = system_cfg.get("polling_interval_seconds", 2.0)
-    enable_breakeven = risk_cfg.get("enable_breakeven_guard", True)
-    breakeven_ratio = risk_cfg.get("breakeven_trigger_ratio", 0.50)
-    enable_profit_ladder = risk_cfg.get("enable_profit_ladder", True)
-    global_ladder_cfg = risk_cfg.get("profit_ladder", {})
-    last_close_attempts = {}  # ticket -> last_attempt_ts
-    tracked_positions = {}  # ticket -> (symbol, open_price, type, magic)
-    last_closed_m15_ts: dict[str, int] = {}
-    inflight_order_lock: dict[str, float] = {}  # {symbol: unix_timestamp_unlock}
-    DUPLICATE_GUARD_SEC = 60.0
+    strategies = {
+        "XAUUSDm": strategy_gold,
+        "USOILm": strategy_oil
+    }
+
     last_status_print = 0.0
+    inflight_order_lock = {}
+    DUPLICATE_GUARD_SEC = 5.0
+    polling_interval = system_cfg.get("polling_interval_seconds", 2.0)
 
-    logger.info("⚡ HFT_ML4T Engine running loop started. Press Ctrl+C to terminate.")
+    logger.info("🎯 [HFT_ML4T] System live and entering event loop.")
 
-    # Main Trading Loop
-    while _running:
-        # Check Zero-Downtime Graceful Hot-Reload Trigger (RESTART_NOW)
-        restart_file = _ROOT / "RESTART_NOW"
-        if restart_file.exists():
-            logger.info("🔄 [HOT-RELOAD] Detected 'RESTART_NOW' signal file. Initiating zero-downtime graceful shutdown...")
-            try:
-                cancelled = mt5_bridge.cancel_all_pending_orders()
-                logger.info(f"🚫 [HOT-RELOAD] Cleaned up {cancelled} pending order(s).")
-            except Exception as e_pend:
-                logger.error(f"[HOT-RELOAD] Error cancelling pending orders: {e_pend}")
-
-            try:
-                feature_collector.close()
-                flush_execution_audit(system_cfg.get("log_dir", "logs"))
-                logger.info("💾 [HOT-RELOAD] ML feature collector & execution audit flushed to disk.")
-            except Exception as e_fl:
-                logger.error(f"[HOT-RELOAD] Error flushing features: {e_fl}")
-
-            try:
-                mt5_bridge.shutdown()
-                logger.info("🔒 [HOT-RELOAD] MT5 connection cleanly disconnected.")
-            except Exception as e_shut:
-                logger.error(f"[HOT-RELOAD] Error during MT5 shutdown: {e_shut}")
-
-            try:
-                if restart_file.exists():
-                    restart_file.unlink()
-                    logger.info("🗑️ [HOT-RELOAD] Removed 'RESTART_NOW' signal file.")
-            except Exception as e_unl:
-                logger.error(f"[HOT-RELOAD] Error removing RESTART_NOW file: {e_unl}")
-
-            logger.info("🚀 [HOT-RELOAD] Shutdown complete. Handing over to Watchdog/Supervisor for instant restart.")
-            sys.exit(42)
-
-        try:
+    try:
+        while _running:
             loop_start = time.time()
+            now_calibrated_utc = get_calibrated_utc()
+
             acc = mt5_bridge.get_account_info()
             if not acc:
-                time.sleep(poll_interval)
+                logger.warning("[HFT_ML4T] Failed to retrieve account telemetry from MT5 bridge.")
+                time.sleep(polling_interval)
                 continue
 
-            risk_desk.update_account_state(acc)
-
-            # Get open positions once per loop
             open_pos_all = mt5_bridge.get_open_positions()
-            current_tickets = {p.ticket: p for p in open_pos_all}
 
-            # A. Detect closed tickets to trigger Cooldown on SL/loss (Whipsaw protection)
-            closed_tickets = [t for t in list(tracked_positions.keys()) if t not in current_tickets]
-            for t in closed_tickets:
-                pos_data = tracked_positions.pop(t)
-                if isinstance(pos_data, dict):
-                    sym_closed = pos_data.get("symbol", "")
-                    open_px = pos_data.get("open_price", 0.0)
-                    p_type = pos_data.get("type", 0)
-                    magic_closed = pos_data.get("magic", 0)
-                else:
-                    sym_closed, open_px, p_type, magic_closed = pos_data[:4]
-
-                try:
-                    import MetaTrader5 as mt5_raw
-                    deal_history = mt5_raw.history_deals_get(position=t)
-                    if deal_history:
-                        exit_deal = [d for d in deal_history if d.entry == 1]
-                        if exit_deal:
-                            d_profit = exit_deal[0].profit + exit_deal[0].swap + exit_deal[0].commission
-                            risk_desk.record_trade_result(
-                                symbol=sym_closed,
-                                profit=d_profit,
-                                comment=exit_deal[0].comment
-                            )
-                except Exception as e:
-                    logger.debug(f"Error checking closed deal #{t}: {e}")
-
-            # B. Apply Breakeven Guard & Dynamic ATR Trailing Stop on active open positions
+            # -------------------------------------------------------------
+            # 1. POSITION MANAGEMENT & IN-FLIGHT BARRIERS (Stage A & Stage B)
+            # -------------------------------------------------------------
             for p in open_pos_all:
-                if p.ticket not in tracked_positions:
-                    tracked_positions[p.ticket] = {
-                        "symbol": p.symbol,
-                        "open_price": p.price_open,
-                        "type": p.type,
-                        "magic": p.magic,
-                        "highest_high": p.price_current,
-                        "lowest_low": p.price_current
-                    }
+                sym_upper = p.symbol.upper()
+                if sym_upper not in ("XAUUSDM", "USOILM"):
+                    continue
 
-                pos_meta = tracked_positions[p.ticket]
-                if isinstance(pos_meta, tuple):  # compatibility
-                    pos_meta = {
-                        "symbol": pos_meta[0],
-                        "open_price": pos_meta[1],
-                        "type": pos_meta[2],
-                        "magic": pos_meta[3],
-                        "highest_high": p.price_current,
-                        "lowest_low": p.price_current
-                    }
-                    tracked_positions[p.ticket] = pos_meta
+                pos_age_min = (time.time() - p.time) / 60.0
+                action = "BUY" if p.type == 0 else "SELL"
 
-                # Update extreme running price
-                if p.type == 0:  # BUY
-                    pos_meta["highest_high"] = max(pos_meta.get("highest_high", p.price_current), p.price_current)
-                else:  # SELL
-                    pos_meta["lowest_low"] = min(pos_meta.get("lowest_low", p.price_current), p.price_current)
+                # Get M15 ATR for dynamic barrier calculation
+                m15_rates = mt5_bridge.get_rates_df(p.symbol, timeframe="M15", count=25)
+                current_atr = 2.0 if "XAU" in sym_upper else 0.35
+                if m15_rates is not None and len(m15_rates) >= 15:
+                    hl = m15_rates["high"] - m15_rates["low"]
+                    hc = (m15_rates["high"] - m15_rates["close"].shift(1)).abs()
+                    lc = (m15_rates["low"] - m15_rates["close"].shift(1)).abs()
+                    current_atr = float(pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean().iloc[-2])
 
-                if enable_breakeven and p.magic in [s.magic for s in strategies.values()]:
-                    s_info = mt5_bridge.get_symbol_info(p.symbol)
-                    p_point = s_info.point if s_info else 0.00001
-                    sym_upper = p.symbol.upper()
-                    # Institutional Asset-Aware Breakeven Buffer (Prevents micro-spread stop-outs)
-                    if "BTC" in sym_upper:
-                        buffer_pts = max(p_point * 500, 5.0)   # >= $5.0 buffer for Bitcoin
-                    elif "US30" in sym_upper:
-                        buffer_pts = max(p_point * 50, 5.0)    # >= 5.0 index pts for Dow Jones
-                    elif "XAU" in sym_upper:
-                        buffer_pts = max(p_point * 65, 0.65)   # >= $0.65 buffer for Gold (widened from 0.25 to prevent noise stop-outs)
-                    elif "OIL" in sym_upper:
-                        buffer_pts = max(p_point * 25, 0.05)   # >= $0.05 buffer for Crude Oil
-                    else:
-                        buffer_pts = p_point * 20              # 2.0 pips buffer for FX
+                new_sl, barrier_reason = execution_manager.evaluate_in_flight_barriers(
+                    symbol=p.symbol,
+                    action=action,
+                    entry_price=p.price_open,
+                    current_price=p.price_current,
+                    current_sl=p.sl,
+                    initial_sl=p.sl,
+                    holding_minutes=pos_age_min,
+                    atr_14=current_atr
+                )
 
-                    tp_dist = abs(p.tp - p.price_open)
-                    profit_dist = (p.price_current - p.price_open) if p.type == 0 else (p.price_open - p.price_current)
+                if new_sl is not None:
+                    logger.info(
+                        f"🛡️ [BARRIER ENGAGED] Ticket #{p.ticket} {p.symbol} {action} | "
+                        f"Moving SL from {p.sl:.3f} to {new_sl:.3f} | Reason: {barrier_reason}"
+                    )
+                    mt5_bridge.modify_position_sl(p, new_sl)
 
-                    # Compute current ATR14 for asset-specific breakeven & trailing thresholds
-                    current_atr = buffer_pts * 2.0
-                    try:
-                        rates_recent = mt5_bridge.get_rates_df(p.symbol, timeframe="M15", count=25)
-                        if rates_recent is not None and len(rates_recent) >= 14:
-                            hl = rates_recent["high"] - rates_recent["low"]
-                            hc = (rates_recent["high"] - rates_recent["close"].shift(1)).abs()
-                            lc = (rates_recent["low"] - rates_recent["close"].shift(1)).abs()
-                            current_atr = float(pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean().iloc[-1])
-                    except Exception as e_atr:
-                        logger.debug(f"ATR calculation error for {p.symbol}: {e_atr}")
-
-                    # STAGE A (Early Breakeven Lock at +1.0R / +1.5x ATR):
-                    # As soon as an open XAUUSDm or USOILm position reaches unrealized profit >= 1.5x ATR14 (~$4.50 / ~$0.40),
-                    # immediately move SL to Entry +/- $0.35 (covering Exness spread + Contabo slippage)
-                    be_offset = 0.35 if "XAU" in sym_upper else (0.05 if "OIL" in sym_upper else buffer_pts)
-                    be_profit_threshold = current_atr * 1.5
-                    if profit_dist >= be_profit_threshold:
-                        if p.type == 0:  # BUY
-                            be_sl = p.price_open + be_offset
-                            if p.sl < be_sl:
-                                logger.info(
-                                    f"🛡️ [STAGE A - BREAKEVEN LOCK] Ticket #{p.ticket} {p.symbol} BUY reached +1.5x ATR "
-                                    f"(+${profit_dist:.2f} >= ${be_profit_threshold:.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}"
-                                )
-                                mt5_bridge.modify_position_sl(p, be_sl)
-                        elif p.type == 1:  # SELL
-                            be_sl = p.price_open - be_offset
-                            if p.sl > be_sl or p.sl == 0:
-                                logger.info(
-                                    f"🛡️ [STAGE A - BREAKEVEN LOCK] Ticket #{p.ticket} {p.symbol} SELL reached +1.5x ATR "
-                                    f"(+${profit_dist:.2f} >= ${be_profit_threshold:.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}"
-                                )
-                                mt5_bridge.modify_position_sl(p, be_sl)
-
-                    # Pre-News Macro Window Guard (14:15 - 14:45 UTC)
-                    # Automatically moves SL to Breakeven (+ buffer) for any profitable USD-sensitive position
-                    is_macro_news = risk_desk.is_macro_news_window(now_utc)
-                    if is_macro_news and getattr(p, "profit", 0.0) > 0 and sym_upper in ("XAUUSDM", "US30M", "USOILM", "GBPUSDM"):
-                        if p.type == 0:  # BUY
-                            be_sl = p.price_open + be_offset
-                            if p.sl < be_sl:
-                                logger.info(f"🛡️ [PRE-NEWS BREAKEVEN] Ticket #{p.ticket} {p.symbol} BUY in profit (${p.profit:+.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}")
-                                mt5_bridge.modify_position_sl(p, be_sl)
-                        elif p.type == 1:  # SELL
-                            be_sl = p.price_open - be_offset
-                            if p.sl > be_sl or p.sl == 0:
-                                logger.info(f"🛡️ [PRE-NEWS BREAKEVEN] Ticket #{p.ticket} {p.symbol} SELL in profit (${p.profit:+.2f}) -> Moving SL from {p.sl:.5f} to Breakeven {be_sl:.5f}")
-                                mt5_bridge.modify_position_sl(p, be_sl)
-
-                    # STAGE B: 45m Stagnation Trailing-Tighten (3 M15 bars, empirical WR peaks at 52.6%)
-                    stagnation_min = risk_cfg.get("stagnation_timeout_minutes", 45)
-                    max_holding_sec = stagnation_min * 60
-                    pos_age_sec = time.time() - p.time
-                    if pos_age_sec >= max_holding_sec:
-                        # Extract H1 trend and M15 OFI for conditional extension check
-                        h1_bullish = None
-                        m15_ofi = None
-                        try:
-                            rates_m15 = mt5_bridge.get_rates_df(p.symbol, timeframe="M15", count=25)
-                            h1_rates = mt5_bridge.get_rates_df(p.symbol, timeframe="H1", count=210)
-                            if rates_m15 is not None and len(rates_m15) >= 20:
-                                from strategies.gold_micro_scalper import calculate_order_flow_imbalance
-                                m15_ofi = float(calculate_order_flow_imbalance(rates_m15.iloc[:-1], window=5))
-                            if h1_rates is not None and len(h1_rates) >= 200:
-                                h1_c = h1_rates["close"].iloc[:-1]
-                                h1_ema50 = float(h1_c.ewm(span=50, adjust=False).mean().iloc[-1])
-                                h1_ema200 = float(h1_c.ewm(span=200, adjust=False).mean().iloc[-1])
-                                h1_bullish = (h1_ema50 > h1_ema200)
-                        except Exception as e_ind:
-                            logger.debug(f"Error computing indicators for conditional time-barrier: {e_ind}")
-
-                        should_close, close_reason = risk_desk.evaluate_conditional_time_barrier(
-                            symbol=p.symbol,
-                            pos_type=p.type,
-                            pos_age_sec=pos_age_sec,
-                            price_open=p.price_open,
-                            price_current=p.price_current,
-                            initial_sl=p.sl,
-                            base_horizon_sec=max_holding_sec,
-                            extended_horizon_sec=max_holding_sec + (30 * 60),  # 75m
-                            h1_trend_bullish=h1_bullish,
-                            m15_ofi=m15_ofi
-                        )
-
-                        if should_close:
-                            # Stagnation Trailing-Tighten: tighten SL to current_price +/- $0.20 ($0.05 on Oil) to avoid spread drag
-                            tight_buffer = 0.20 if "XAU" in sym_upper else (0.05 if "OIL" in sym_upper else buffer_pts * 0.5)
-                            if p.type == 0:  # BUY
-                                tight_sl = p.price_current - tight_buffer
-                                if tight_sl > p.sl:
-                                    logger.info(
-                                        f"🎯 [STAGE B - TRAILING-TIGHTEN] Stagnation ({pos_age_sec/60:.1f}m >= {stagnation_min}m). "
-                                        f"Tightening SL on Ticket #{p.ticket} {p.symbol} from {p.sl:.5f} to {tight_sl:.5f} (Buffer: ${tight_buffer:.2f}) to avoid spread drag."
-                                    )
-                                    mt5_bridge.modify_position_sl(p, tight_sl)
-                            elif p.type == 1:  # SELL
-                                tight_sl = p.price_current + tight_buffer
-                                if tight_sl < p.sl or p.sl == 0:
-                                    logger.info(
-                                        f"🎯 [STAGE B - TRAILING-TIGHTEN] Stagnation ({pos_age_sec/60:.1f}m >= {stagnation_min}m). "
-                                        f"Tightening SL on Ticket #{p.ticket} {p.symbol} from {p.sl:.5f} to {tight_sl:.5f} (Buffer: ${tight_buffer:.2f}) to avoid spread drag."
-                                    )
-                                    mt5_bridge.modify_position_sl(p, tight_sl)
-
-                            # Hard emergency exit past 75m or Friday flat
-                            if pos_age_sec >= (max_holding_sec + 30 * 60) or risk_desk.is_friday_hard_flat_time(now_utc):
-                                now_ts = time.time()
-                                if now_ts - last_close_attempts.get(p.ticket, 0) >= 300:
-                                    last_close_attempts[p.ticket] = now_ts
-                                    logger.info(f"⏳ [HARD-TIME-BARRIER] Closing Ticket #{p.ticket} {p.symbol} after {pos_age_sec/60:.1f}m ({close_reason})")
-                                    mt5_bridge.close_position(p, comment="TIME_BARRIER")
-                            continue
-                        else:
-                            if int(pos_age_sec) % 300 < 5:
-                                logger.info(f"⏳ [TIME-BARRIER EXTENSION] Ticket #{p.ticket} {p.symbol} held {pos_age_sec/60:.1f}m: {close_reason}")
-
-                    # Tier 1: Dynamic ATR Trailing Stop with Guaranteed Breakeven Floor (for trend continuation)
-                    trailing_cfg = risk_cfg.get("trailing_stop", {})
-                    if trailing_cfg.get("enabled", True) and tp_dist > 0:
-                        if "XAU" in sym_upper:
-                            atr_mult = 2.2  # Broadened to 2.2x ATR to give Gold trend breathing room
-                        else:
-                            atr_mult = trailing_cfg.get("atr_multiplier", 1.5)
-                        min_gain_ratio = trailing_cfg.get("min_gain_ratio", 0.60)
-
-                        if p.type == 0:  # BUY
-                            if profit_dist >= max(current_atr * 1.5, tp_dist * min_gain_ratio):
-                                be_sl = p.price_open + be_offset
-                                dyn_sl = pos_meta["highest_high"] - (atr_mult * current_atr)
-                                target_sl = max(be_sl, dyn_sl)
-                                if p.sl < target_sl:
-                                    logger.info(f"🎯 [ATR TRAILING] Ticket #{p.ticket} {p.symbol} BUY: Moving SL from {p.sl:.5f} to {target_sl:.5f}")
-                                    mt5_bridge.modify_position_sl(p, target_sl)
-
-                        elif p.type == 1:  # SELL
-                            if profit_dist >= max(current_atr * 1.5, tp_dist * min_gain_ratio):
-                                be_sl = p.price_open - be_offset
-                                dyn_sl = pos_meta["lowest_low"] + (atr_mult * current_atr)
-                                target_sl = min(be_sl, dyn_sl)
-                                if p.sl > target_sl or p.sl == 0:
-                                    logger.info(f"🎯 [ATR TRAILING] Ticket #{p.ticket} {p.symbol} SELL: Moving SL from {p.sl:.5f} to {target_sl:.5f}")
-                                    mt5_bridge.modify_position_sl(p, target_sl)
-
-            # Periodic heartbeat telemetry print (every 60s)
+            # -------------------------------------------------------------
+            # 2. PERIODIC HEARTBEAT TELEMETRY (Every 60s)
+            # -------------------------------------------------------------
             if loop_start - last_status_print >= 60.0:
                 last_status_print = loop_start
                 logger.info(
-                    f"💓 [HEARTBEAT] Equity: ${acc['equity']:,.2f} | Margin Level: {acc.get('margin_level', 0):.1f}% | "
-                    f"Open Positions: {len(open_pos_all)} | Mode: {'LIVE' if live_trading_env else 'PAPER'}"
+                    f"💓 [HEARTBEAT] Real UTC: {format_real_utc_log(now_calibrated_utc)} | "
+                    f"Equity: ${acc['equity']:,.2f} | Margin Level: {acc.get('margin_level', 0):.1f}% | "
+                    f"Open Positions: {len(open_pos_all)} | News Shield: ACTIVE | Mode: LIVE"
                 )
 
-            # Evaluate each symbol
-            for sym, strat in strategies.items():
+            # -------------------------------------------------------------
+            # 3. ALPHA GENERATION & DECOUPLED RISK EXECUTION
+            # -------------------------------------------------------------
+            for sym, strat_engine in strategies.items():
                 if not _running:
                     break
 
-                now_utc_dt = datetime.now(timezone.utc)
                 now_ts = time.time()
-
-                # 1. HARD WEEKEND / OVERNIGHT FLATTEN GUARD (Chặn lỗ qua tuần như lệnh USOILm -$153)
-                friday_close_hm = getattr(risk_desk, "friday_hard_flat_utc", None) or strat.config.get("friday_hard_close_utc", "13:00")
-                if "BTC" not in sym.upper() and now_utc_dt.weekday() == 4 and now_utc_dt.strftime("%H:%M") >= friday_close_hm:
-                    sym_open_positions = [p for p in open_pos_all if p.symbol == sym and p.magic == strat.magic]
-                    for pos in sym_open_positions:
-                        if now_ts - last_close_attempts.get(pos.ticket, 0) >= 60.0:
-                            last_close_attempts[pos.ticket] = now_ts
-                            logger.info(f"🛑 [FRIDAY_HARD_EXIT] Flattening Ticket #{pos.ticket} {sym} before weekend close ({friday_close_hm} UTC)")
-                            mt5_bridge.close_position(pos, comment="FRIDAY_HARD_EXIT")
-                    continue
-
-                # Block weekend trading on non-crypto symbols
-                if "BTC" not in sym.upper() and now_utc_dt.weekday() >= 5:
-                    continue
-
-                # 2. LOCAL IN-MEMORY ANTI-DUPLICATE LOCK (Chặn Race Condition < 1s)
+                # Anti-duplicate lock (< 5s)
                 if now_ts < inflight_order_lock.get(sym, 0.0):
                     continue
 
@@ -527,177 +234,88 @@ def main():
                 if not snapshot:
                     continue
 
-                # Market freshness / Stale Tick Guard: Skip traditional assets if market is closed (ticks older than 30s for US30, 180s for others)
-                tick_age = now_ts - snapshot.get("time", 0)
-                max_tick_age = 30.0 if "US30" in sym.upper() else 180.0
-                if tick_age > max_tick_age and "BTC" not in sym.upper():
+                # Max 1 concurrent position per symbol
+                sym_positions = [p for p in open_pos_all if p.symbol == sym]
+                if len(sym_positions) >= 1:
                     continue
 
-                # Trading Session Gate for US30m & Session-Restricted Assets
-                hm_str = now_utc_dt.strftime("%H:%M")
-                session_window = strat.config.get("trading_session_utc")
-                if session_window and len(session_window) == 2:
-                    if not (session_window[0] <= hm_str <= session_window[1]):
-                        continue
-
-                sym_positions = [p for p in open_pos_all if p.symbol == sym and p.magic == strat.magic]
-                if len(sym_positions) >= risk_cfg.get("max_positions_per_symbol", 1):
+                # Ingestion: Fetch closed M15 and H1 bars
+                rates_m15 = mt5_bridge.get_rates_df(sym, timeframe="M15", count=105)
+                rates_h1 = mt5_bridge.get_rates_df(sym, timeframe="H1", count=220)
+                if rates_m15 is None or len(rates_m15) < 50 or rates_h1 is None or len(rates_h1) < 55:
                     continue
 
-                # Current net inventory
-                net_inventory = 0.0
-                for p in sym_positions:
-                    net_inventory += p.volume if p.type == 0 else -p.volume
+                clean_m15, m15_features = data_ingestion.prepare_closed_series(rates_m15)
+                clean_h1, _ = data_ingestion.prepare_closed_series(rates_h1)
 
-                # Pre-trade Risk Audit
-                is_safe, risk_reason = risk_desk.check_pre_trade_safety(
-                    symbol=sym,
-                    current_spread_points=snapshot["spread_points"],
-                    max_allowed_spread_points=strat.max_spread_points,
-                    open_positions=open_pos_all,
-                    account_info=acc
-                )
+                # Tier 2: Pure Strategy Signal Generation
+                if sym == "XAUUSDm":
+                    ah, al, _ = data_ingestion.extract_asian_range(rates_m15)
+                    signal = strat_engine.evaluate(
+                        closed_m15_df=clean_m15,
+                        features=m15_features,
+                        asian_high=ah,
+                        asian_low=al,
+                        now_utc=now_calibrated_utc
+                    )
+                elif sym == "USOILm":
+                    signal = strat_engine.evaluate(
+                        closed_m15_df=clean_m15,
+                        features=m15_features,
+                        h1_df=clean_h1,
+                        now_utc=now_calibrated_utc
+                    )
+                else:
+                    signal = None
 
-                if not is_safe:
-                    continue
+                if signal and signal.action:
+                    # Tier 3: Decoupled Execution & Risk Desk Gating
+                    sym_info = mt5_bridge.get_symbol_info(sym)
+                    contract_size = sym_info.trade_contract_size if sym_info else 100.0
 
-                # 3. LẤY DỮ LIỆU NẾN & TÁCH BIỆT NẾN ĐÃ ĐÓNG (iloc[:-1]) VS NẾN ĐANG CHẠY (iloc[-1])
-                rates_df = mt5_bridge.get_rates_df(sym, timeframe=strat.config.get("timeframe", "M15"), count=105)
-                rates_h1 = mt5_bridge.get_rates_df(sym, timeframe="H1", count=250)
-                if rates_df is None or len(rates_df) < 50 or rates_h1 is None or len(rates_h1) < 55:
-                    continue
-
-                # Rule #2 Compliance: Chỉ truyền các nến ĐÃ ĐÓNG hoàn toàn vào bộ lọc xu hướng & CUSUM
-                closed_m15_df = rates_df.iloc[:-1].copy()
-                closed_h1_df = rates_h1.iloc[:-1].copy()
-                raw_last_t = closed_m15_df["time"].iloc[-1]
-                latest_closed_bar_ts = int(raw_last_t.timestamp()) if hasattr(raw_last_t, "timestamp") else int(raw_last_t)
-
-                is_new_m15_bar = (last_closed_m15_ts.get(sym) != latest_closed_bar_ts)
-                if is_new_m15_bar:
-                    last_closed_m15_ts[sym] = latest_closed_bar_ts
-                    if hasattr(strat, "cusum_filter"):
-                        strat.cusum_filter.update_on_closed_bar(sym, closed_m15_df)
-
-                sym_info = mt5_bridge.get_symbol_info(sym)
-                contract_size = sym_info.trade_contract_size if sym_info else 100.0
-                min_lot = sym_info.volume_min if sym_info else 0.01
-                lot_step = sym_info.volume_step if sym_info else 0.01
-
-                # Evaluate strategy with Nautilus De-risking Multiplier, Session Multiplier & Tier 1 Pod Recovery Sizing
-                risk_mult = risk_desk.get_risk_multiplier(acc["equity"])
-                pod_mult = risk_desk.get_symbol_risk_multiplier(sym)
-                session_lot_mult = risk_desk.get_session_lot_multiplier(sym, now_utc_dt)
-                effective_risk_mult = risk_mult * pod_mult * session_lot_mult
-                if effective_risk_mult <= 0:
-                    continue
-
-                signal_res = strat.evaluate(
-                    rates_df=closed_m15_df,
-                    market_snapshot=snapshot,
-                    current_inventory=net_inventory,
-                    account_equity=acc["equity"],
-                    contract_size=contract_size,
-                    min_lot=min_lot,
-                    lot_step=lot_step,
-                    risk_multiplier=effective_risk_mult,
-                    h1_df=closed_h1_df,
-                    closed_rates_df=closed_m15_df,
-                    closed_h1_df=closed_h1_df,
-                    now_utc=now_utc_dt,
-                    is_new_bar=is_new_m15_bar
-                )
-
-                if signal_res:
-                    action = signal_res["action"]
-                    lot = signal_res["lot"]
-                    sl = signal_res["sl_price"]
-                    tp = signal_res["tp_price"]
-                    magic = signal_res["magic"]
-                    comment = signal_res["comment"]
-
-                    logger.info(
-                        f"⚡ [SIGNAL] {sym} -> {action} {lot} lots | SL: {sl:.5f} | TP: {tp:.5f} | "
-                        f"OFI: {signal_res.get('ofi', 0):.2f} | Vol: {signal_res.get('volatility', 0):.4f}"
+                    trade_instr, exec_reason = execution_manager.process_signal(
+                        signal=signal,
+                        account_equity=acc["equity"],
+                        market_snapshot=snapshot,
+                        features=m15_features,
+                        contract_size=contract_size,
+                        now_utc=now_calibrated_utc
                     )
 
-                    if live_trading_env:
-                        # Khóa ngay lập tức TRƯỚC khi gửi lệnh qua mạng để tránh tick kế tiếp lọt qua (< 1s race condition)
-                        inflight_order_lock[sym] = time.time() + DUPLICATE_GUARD_SEC
-
-                        # Real money order dispatch with expected reservation price telemetry
-                        target_exp_price = signal_res.get("reservation_price") or snapshot.get("mid", 0.0)
-                        success, msg, ticket = mt5_bridge.send_order(
-                            symbol=sym,
-                            order_type=action,
-                            lot=lot,
-                            sl_price=sl,
-                            tp_price=tp,
-                            magic=magic,
-                            comment=comment,
-                            expected_price=target_exp_price
+                    if trade_instr:
+                        inflight_order_lock[sym] = now_ts + DUPLICATE_GUARD_SEC
+                        logger.info(
+                            f"⚡ [EXEC_APPROVED] {sym} -> {trade_instr.action} {trade_instr.volume} lots | "
+                            f"SL: {trade_instr.sl_price:.3f} | TP: {trade_instr.tp_price:.3f} | "
+                            f"Risk: ${trade_instr.risk_usd:.2f} (1R) | Reason: {exec_reason}"
                         )
-                        signal_res["execution_status"] = "FILLED" if success else "FAILED"
-                        signal_res["order_ticket"] = ticket
-                        signal_res["error_message"] = msg
-
-                        exec_metrics = mt5_bridge.get_last_execution_metrics()
-                        if exec_metrics:
-                            signal_res["execution_metrics"] = exec_metrics
-                            risk_desk.record_execution_metric(
-                                symbol=sym,
-                                latency_ms=exec_metrics.get("latency_ms", 0.0),
-                                slippage_points=exec_metrics.get("slippage_points", 0.0)
-                            )
-
+                        success, msg, ticket = mt5_bridge.send_order(
+                            symbol=trade_instr.symbol,
+                            order_type=trade_instr.action,
+                            lot=trade_instr.volume,
+                            sl_price=trade_instr.sl_price,
+                            tp_price=trade_instr.tp_price,
+                            magic=trade_instr.magic,
+                            comment=trade_instr.comment,
+                            expected_price=snapshot.get("mid", 0.0)
+                        )
                         if success:
-                            risk_desk.consume_recovery_trade(sym)
-                            risk_desk.trigger_cooldown(sym, duration_sec=DUPLICATE_GUARD_SEC, reason="Post-Fill Anti-Duplicate Guard")
-                            open_pos_all = mt5_bridge.get_open_positions()
+                            logger.info(f"✅ [ORDER_FILLED] Ticket #{ticket} {sym} {trade_instr.action} {trade_instr.volume} lots @ {snapshot.get('mid', 0.0)}")
                         else:
-                            logger.warning(f"⚠️ [ORDER REJECTED BY BROKER/MT5] {sym}: {msg}")
-                            if not ("10018" in str(msg) or "10027" in str(msg)):
-                                inflight_order_lock[sym] = time.time() + 5.0
+                            logger.error(f"❌ [ORDER_REJECTED] {sym} {trade_instr.action} Failed: {msg}")
                     else:
-                        logger.info(f"🛡️ [PAPER TRADE ONLY] Order suppressed because LIVE_TRADING=false")
-                        signal_res["execution_status"] = "PAPER_SIMULATED"
-                        signal_res["order_ticket"] = None
-
-                    # Audit Record Logging
-                    log_trade_audit(str(_ROOT / "logs"), signal_res)
-
-                    # Machine Learning Parquet Feature Telemetry
-                    exec_stats = risk_desk.get_execution_stats(sym)
-                    feature_collector.record_feature(
-                        symbol=sym,
-                        mid_price=snapshot.get("mid", 0.0),
-                        spread_points=snapshot.get("spread_points", 0.0),
-                        ofi=signal_res.get("ofi", 0.0),
-                        garman_klass_vol=signal_res.get("volatility", 0.0),
-                        micro_vol=signal_res.get("micro_volatility", signal_res.get("volatility", 0.0)),
-                        dynamic_kappa=signal_res.get("dynamic_kappa", 1.5),
-                        reservation_price=signal_res.get("reservation_price", snapshot.get("mid", 0.0)),
-                        skew_offset=signal_res.get("skew_offset", 0.0),
-                        action=action,
-                        macro_regime=signal_res.get("macro_regime", "UNKNOWN"),
-                        slope_ema21_pct=signal_res.get("slope_ema21_pct", 0.0),
-                        recent_slippage_pts=exec_stats.get("avg_slippage_points", 0.0),
-                        recent_latency_ms=exec_stats.get("avg_latency_ms", 0.0)
-                    )
+                        logger.debug(f"🛡️ [RISK_VETO] {sym} signal vetoed: {exec_reason}")
 
             elapsed = time.time() - loop_start
-            sleep_time = max(0.1, poll_interval - elapsed)
+            sleep_time = max(0.1, polling_interval - elapsed)
             time.sleep(sleep_time)
 
-        except Exception as e:
-            logger.error(f"Error in main loop: {e}", exc_info=True)
-            time.sleep(3.0)
-
-    # Clean shutdown
-    feature_collector.flush()
-    mt5_bridge.shutdown()
-    logger.info("✅ HFT_ML4T shutdown completed.")
-
+    except Exception as e:
+        logger.critical(f"🛑 [FATAL CRASH] Unhandled exception in main loop: {e}", exc_info=True)
+    finally:
+        mt5_bridge.shutdown()
+        release_process_lock()
+        logger.info("🏁 [HFT_ML4T] Process shutdown complete.")
 
 if __name__ == "__main__":
     main()
